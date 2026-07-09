@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 測定・デバッグスクリプト（開発時のみ使用）
+measure_*.py
+take_screenshot*.py
+annotate_*.py
+find_*.py
+analyze_screenshot.py
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# OS
+.DS_Store
+Thumbs.db
