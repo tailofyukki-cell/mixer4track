@@ -25,6 +25,7 @@ from track_model import TrackModel
 from eq_engine import EQEngine, EQParams
 from effect_engine import EffectEngine, EFFECT_PRESETS
 from geq_engine import GEQEngine, GEQParams
+import mic_engine
 
 
 # ------------------------------------------------------------------
@@ -207,6 +208,10 @@ class AudioEngine:
         self._stream_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
+
+        # MICリアルタイム入力用チャンネル（トラックごと）
+        self._mic_channels: Dict[int, Optional[object]] = {}
+        self._mic_thread: Optional[threading.Thread] = None
 
         self._init_pygame()
 
@@ -445,6 +450,91 @@ class AudioEngine:
             time.sleep(CHUNK_SEC * 0.25)  # ポーリング間隔
 
         self._playing = False
+
+    # ------------------------------------------------------------------
+    # MICリアルタイム入力ループ（独立スレッド）
+    # ------------------------------------------------------------------
+
+    def start_mic_loop(self, tracks: List[TrackModel]):
+        """
+        MIC入力が割り当てられたトラックのリアルタイム再生ループを開始する。
+        ファイル再生ループとは独立したスレッドで動作する。
+        """
+        if self._mic_thread is not None and self._mic_thread.is_alive():
+            return  # 既に起動済み
+        self._mic_thread = threading.Thread(
+            target=self._mic_loop,
+            args=(list(tracks),),
+            daemon=True,
+            name="MicLoop"
+        )
+        self._mic_thread.start()
+
+    def stop_mic_loop(self):
+        """マイクループを停止する（_stop_eventを共有）。"""
+        # _stop_eventは_stream_loopと共有。stop_all()で一括停止される。
+        if self._mic_thread is not None:
+            self._mic_thread.join(timeout=1.0)
+            self._mic_thread = None
+
+    def _mic_loop(self, tracks: List[TrackModel]):
+        """
+        MIC入力トラックのリアルタイム再生ループ。
+        mic_engineからCHUNK_SAMPLESフレームずつ読み出し、
+        pygame.mixer.Channelにキューする。
+        """
+        if not self._initialized:
+            return
+
+        any_solo = any(t.solo for t in tracks)
+
+        # MICが割り当てられたトラックのチャンネルを確保
+        mic_tracks = [t for t in tracks if mic_engine.has_mic(t.track_id)]
+        for track in mic_tracks:
+            ch = self._pygame.mixer.find_channel(True)
+            if ch is not None:
+                with self._lock:
+                    self._mic_channels[track.track_id] = ch
+
+        while not self._stop_event.is_set():
+            any_solo = any(t.solo for t in tracks)
+
+            for track in tracks:
+                if not mic_engine.has_mic(track.track_id):
+                    continue
+                stream = mic_engine.get_mic_stream(track.track_id)
+                if stream is None:
+                    continue
+                ch = self._mic_channels.get(track.track_id)
+                if ch is None:
+                    ch = self._pygame.mixer.find_channel(True)
+                    if ch is None:
+                        continue
+                    with self._lock:
+                        self._mic_channels[track.track_id] = ch
+
+                # MICチャンクを読み出してステレオに変換
+                mono = stream.read_chunk(CHUNK_SAMPLES)  # (CHUNK_SAMPLES,) float32
+                stereo = np.stack([mono, mono], axis=1)  # (CHUNK_SAMPLES, 2)
+
+                sound = self._chunk_to_sound(stereo, track, any_solo)
+                if not ch.get_busy():
+                    ch.play(sound)
+                else:
+                    if ch.get_queue() is None:
+                        ch.queue(sound)
+
+            time.sleep(CHUNK_SEC * 0.5)
+
+        # ループ終了時にチャンネルを解放
+        with self._lock:
+            for track_id, ch in self._mic_channels.items():
+                if ch is not None:
+                    try:
+                        ch.stop()
+                    except Exception:
+                        pass
+            self._mic_channels.clear()
 
     def _chunk_to_sound(self, chunk: np.ndarray, track: TrackModel,
                         any_solo: bool) -> object:
@@ -730,6 +820,8 @@ class AudioEngine:
     def cleanup(self):
         """エンジンを終了する。アプリ終了時に呼ぶ。"""
         self.stop_all()
+        self.stop_mic_loop()
+        mic_engine.stop_all()  # 全マイクストリームを停止
         if self._initialized:
             try:
                 self._pygame.mixer.quit()

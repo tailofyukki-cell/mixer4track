@@ -16,7 +16,8 @@ from typing import List, Optional
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSlider, QLabel, QPushButton, QFileDialog, QFrame, QSizePolicy,
-    QMessageBox, QProgressDialog, QComboBox, QSpacerItem
+    QMessageBox, QProgressDialog, QComboBox, QSpacerItem,
+    QDialog, QDialogButtonBox, QListWidget, QListWidgetItem
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, pyqtSlot, QPoint
 from PyQt5.QtGui import (
@@ -32,6 +33,80 @@ from geq_engine import (
     GEQParams, GEQEngine, GEQ_LOW_BANDS, GEQ_HI_BANDS,
     get_geq_response_db, GEQ_GAIN_MIN, GEQ_GAIN_MAX
 )
+import mic_engine
+
+
+# ===========================================================================
+# マイクデバイス選択ダイアログ
+# ===========================================================================
+class MicDeviceDialog(QDialog):
+    """
+    マイク入力デバイスを選択するダイアログ。
+    mic_engine.get_input_devices() で取得したデバイス一覧を表示し、
+    ユーザーが選択したデバイスの (index, name) を返す。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("マイクデバイスを選択")
+        self.setMinimumWidth(360)
+        self.setStyleSheet("""
+            QDialog { background-color: #1e1e2e; color: #e8e8e8; }
+            QLabel { color: #e8e8e8; font-size: 11px; }
+            QListWidget {
+                background-color: #2a2a3e; color: #e8e8e8;
+                border: 1px solid #444; border-radius: 4px;
+                font-size: 11px;
+            }
+            QListWidget::item:selected { background-color: #4a90d9; color: #fff; }
+            QListWidget::item:hover { background-color: #3a3a5e; }
+            QPushButton {
+                background-color: #2c3e50; color: #e8e8e8;
+                border: 1px solid #444; border-radius: 4px;
+                padding: 4px 16px; font-size: 11px;
+            }
+            QPushButton:hover { background-color: #34495e; }
+        """)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        label = QLabel("入力デバイスを選択してください:")
+        layout.addWidget(label)
+
+        self._list = QListWidget()
+        self._list.setMinimumHeight(160)
+        self._devices = mic_engine.get_input_devices()
+        for idx, name in self._devices:
+            item = QListWidgetItem(f"{name}")
+            item.setData(Qt.UserRole, (idx, name))
+            self._list.addItem(item)
+        if self._list.count() > 0:
+            self._list.setCurrentRow(0)
+        self._list.itemDoubleClicked.connect(self.accept)
+        layout.addWidget(self._list)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        btns.setStyleSheet("""
+            QPushButton { background-color: #2c3e50; color: #e8e8e8;
+                border: 1px solid #444; border-radius: 4px; padding: 4px 16px; }
+            QPushButton:hover { background-color: #34495e; }
+        """)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def selected_device(self):
+        """
+        選択されたデバイスの (index, name) を返す。
+        未選択の場合は None を返す。
+        """
+        item = self._list.currentItem()
+        if item:
+            return item.data(Qt.UserRole)
+        return None
 
 
 # ===========================================================================
@@ -937,8 +1012,9 @@ class TrackWidget(QFrame):
     eq_changed          = pyqtSignal(int, object)  # (track_id, EQParams)
     effect_changed      = pyqtSignal(int, str, bool)  # (track_id, preset_name, enabled)
     geq_band_changed    = pyqtSignal(int, float, float)  # (track_id, band_freq, gain_db)
+    mic_toggled         = pyqtSignal(int)  # (track_id) - MICボタンクリック時
 
-    # キーボードショートカット（バンク内インデックス 0〜7）
+    # キーボードショートカット（バンク内インデックス 0～7）
     KEY_LABELS = ["A / Z", "S / X", "D / C", "F / V", "G / B", "H / N", "J / M", "K / ,"]
 
     def __init__(self, track: TrackModel, bank: int = 0, parent=None):
@@ -1060,20 +1136,26 @@ class TrackWidget(QFrame):
         self._eq_widget.eq_changed.connect(self.eq_changed)
         layout.addWidget(self._eq_widget)
 
-        # ミュート / ソロ
+        # ミュート / ソロ / MIC
         ms_layout = QHBoxLayout()
         ms_layout.setSpacing(4)
         self._mute_btn = QPushButton("M")
-        self._mute_btn.setFixedSize(34, 24)
+        self._mute_btn.setFixedSize(28, 24)
         self._solo_btn = QPushButton("S")
-        self._solo_btn.setFixedSize(34, 24)
+        self._solo_btn.setFixedSize(28, 24)
+        self._mic_btn = QPushButton("MIC")
+        self._mic_btn.setFixedSize(34, 24)
+        self._mic_btn.setToolTip("マイク入力を割り当てる")
         self._mute_btn.setStyleSheet(self._btn_style(False, is_mute=True))
         self._solo_btn.setStyleSheet(self._btn_style(False, is_mute=False))
+        self._mic_btn.setStyleSheet(self._mic_btn_style(False))
         self._mute_btn.clicked.connect(lambda: self.mute_toggled.emit(self._track.track_id))
         self._solo_btn.clicked.connect(lambda: self.solo_toggled.emit(self._track.track_id))
+        self._mic_btn.clicked.connect(lambda: self.mic_toggled.emit(self._track.track_id))
         ms_layout.addStretch()
         ms_layout.addWidget(self._mute_btn)
         ms_layout.addWidget(self._solo_btn)
+        ms_layout.addWidget(self._mic_btn)
         ms_layout.addStretch()
         layout.addLayout(ms_layout)
 
@@ -1158,6 +1240,28 @@ class TrackWidget(QFrame):
             }}
             QPushButton:hover {{ background-color: {hover}; }}
         """
+
+    def _mic_btn_style(self, active: bool) -> str:
+        """MICボタンのスタイルを返す。active=Trueのとき点灯（青色）。"""
+        bg = "#1a6fa8" if active else "#333333"
+        border = "#4a90d9" if active else "#444"
+        hover = "#1e8bc3" if active else "#555"
+        return f"""
+            QPushButton {{
+                background-color: {bg}; color: {Colors.TEXT_PRIMARY};
+                border: 1px solid {border}; border-radius: 3px;
+                font-size: 9px; font-weight: bold;
+            }}
+            QPushButton:hover {{ background-color: {hover}; }}
+        """
+
+    def update_mic_state(self, active: bool, device_name: str = ""):
+        """MICボタンの点灯状態を更新する。"""
+        self._mic_btn.setStyleSheet(self._mic_btn_style(active))
+        if active and device_name:
+            self._mic_btn.setToolTip(f"マイク: {device_name}")
+        else:
+            self._mic_btn.setToolTip("マイク入力を割り当てる")
 
     def _on_fader_changed(self, value: int):
         # GEQモード中はフェーダーをGEQコントローラーとして使用
@@ -1835,6 +1939,7 @@ class MixerMainWindow(QMainWindow):
             tw.mute_toggled.connect(self._on_mute_toggled)
             tw.solo_toggled.connect(self._on_solo_toggled)
             tw.eq_changed.connect(self._on_eq_changed)
+            tw.mic_toggled.connect(self._on_mic_toggled)
             self._track_widgets.append(tw)
             layout.addWidget(tw)
 
@@ -2160,6 +2265,36 @@ class MixerMainWindow(QMainWindow):
         self._track_widgets[track_id].update_solo_state(track.solo)
         self._engine.update_all_tracks(self._tracks)
         self._set_status(f"Track {track_id + 1}: Solo {'ON' if track.solo else 'OFF'}")
+
+    def _on_mic_toggled(self, track_id: int):
+        """
+        MICボタンクリック時のコールバック。
+        - MICが未割り当ての場合: デバイス選択ダイアログを開き、割り当てる
+        - MICが既に割り当て済みの場合: 解除する
+        """
+        if mic_engine.has_mic(track_id):
+            # 既に割り当て済み → 解除
+            mic_engine.release_mic(track_id)
+            self._track_widgets[track_id].update_mic_state(False)
+            self._set_status(f"Track {track_id + 1}: MIC 入力解除")
+        else:
+            # 未割り当て → デバイス選択ダイアログを開く
+            dlg = MicDeviceDialog(self)
+            if dlg.exec_() != QDialog.Accepted:
+                return
+            result = dlg.selected_device()
+            if result is None:
+                return
+            dev_index, dev_name = result
+            ok = mic_engine.assign_mic(track_id, dev_index, dev_name)
+            if ok:
+                self._track_widgets[track_id].update_mic_state(True, dev_name)
+                # MICループを開始（ファイル再生中でも独立して動作）
+                self._engine.start_mic_loop(self._tracks)
+                self._set_status(f"Track {track_id + 1}: MIC 入力 「{dev_name}」 割り当て済み")
+            else:
+                QMessageBox.warning(self, "MIC エラー",
+                    f"マイクデバイスの引き当てに失敗しました。\nデバイス: {dev_name}")
 
     def _on_eq_changed(self, track_id: int, params):
         """
