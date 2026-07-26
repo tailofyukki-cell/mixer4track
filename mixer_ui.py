@@ -129,11 +129,18 @@ class EQCurveView(QWidget):
         self.setMaximumHeight(90)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setStyleSheet("background-color: #0d1117; border-radius: 3px;")
+        # スペクトラムアナライザー用バンドデータ（0.0〜1.0）
+        self._spectrum_bands = None  # numpy ndarray or None
 
     def update_curve(self, params):
         """EQParamsを受け取って周波数特性カーブを再描画する。"""
         from eq_engine import get_response_db
         self._response = get_response_db(params, n_points=150)
+        self.update()
+
+    def update_spectrum(self, bands):
+        """スペクトルバンドデータを更新して再描画する。"""
+        self._spectrum_bands = bands
         self.update()
 
     def clear(self):
@@ -153,6 +160,23 @@ class EQCurveView(QWidget):
 
         # 背景
         painter.fillRect(0, 0, w, h, QColor("#0d1117"))
+
+        # ─── スペクトラムアナライザー バー描画（EQカーブの背景に重ねる）───
+        if self._spectrum_bands is not None and len(self._spectrum_bands) > 0:
+            import numpy as _np
+            bands = self._spectrum_bands
+            num_bands = len(bands)
+            bar_w = max(1, draw_w // num_bands)
+            bar_color = QColor(self._accent)
+            bar_color.setAlpha(55)  # 半透明（EQカーブが見えるように）
+            painter.setPen(Qt.NoPen)
+            for i, val in enumerate(bands):
+                if val <= 0.01:
+                    continue
+                bx = mx + int(i * draw_w / num_bands)
+                bar_h = int(val * draw_h)
+                by = my + draw_h - bar_h
+                painter.fillRect(bx, by, max(1, bar_w - 1), bar_h, bar_color)
 
         # グリッド線（0dB・±6dB・±12dB）
         for db in [-12, -6, 0, 6, 12]:
@@ -248,6 +272,13 @@ class GEQCurveView(QWidget):
         self.setMaximumHeight(90)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setStyleSheet("background-color: #0d1117; border-radius: 3px;")
+        # スペクトラムアナライザー用バンドデータ（0.0〜1.0）
+        self._spectrum_bands = None  # numpy ndarray or None
+
+    def update_spectrum(self, bands):
+        """スペクトルバンドデータを更新して再描画する。"""
+        self._spectrum_bands = bands
+        self.update()
 
     def update_curve(self, params: GEQParams):
         """GEQParamsを受け取ってカーブを再描画する。"""
@@ -268,6 +299,22 @@ class GEQCurveView(QWidget):
         center_y = my + draw_h // 2
 
         painter.fillRect(0, 0, w, h, QColor("#0d1117"))
+
+        # ─── スペクトラムアナライザー バー描画（GEQカーブの背景に重ねる）───
+        if self._spectrum_bands is not None and len(self._spectrum_bands) > 0:
+            bands = self._spectrum_bands
+            num_bands = len(bands)
+            bar_w = max(1, draw_w // num_bands)
+            bar_color = QColor("#D4A017")  # GEQアクセントカラー（黄色系）
+            bar_color.setAlpha(55)
+            painter.setPen(Qt.NoPen)
+            for i, val in enumerate(bands):
+                if val <= 0.01:
+                    continue
+                bx = mx + int(i * draw_w / num_bands)
+                bar_h = int(val * draw_h)
+                by = my + draw_h - bar_h
+                painter.fillRect(bx, by, max(1, bar_w - 1), bar_h, bar_color)
 
         # グリッド線
         import math as _math
@@ -2176,6 +2223,13 @@ class MixerMainWindow(QMainWindow):
                 self._pseudo_levels[i] *= 0.85
                 tw.update_level(self._pseudo_levels[i])
 
+            # スペクトラムアナライザー更新
+            try:
+                bands = self._engine.get_spectrum_bands(i)
+                tw._eq_curve.update_spectrum(bands)
+            except Exception:
+                pass
+
         # MASTERメーター
         if is_playing:
             avg = sum(self._pseudo_levels) / max(len(self._pseudo_levels), 1)
@@ -2185,6 +2239,16 @@ class MixerMainWindow(QMainWindow):
             self._master_pseudo_level *= 0.85
         if self._master_widget:
             self._master_widget.update_level(self._master_pseudo_level)
+            # MASTERのGEQカーブにもスペクトル更新（全トラックの平均）
+            try:
+                import numpy as _np
+                all_bands = [self._engine.get_spectrum_bands(i) for i in range(self.NUM_TRACKS)]
+                valid = [b for b in all_bands if b is not None and len(b) > 0]
+                if valid:
+                    avg_bands = _np.mean(valid, axis=0)
+                    self._master_widget._geq_curve.update_spectrum(avg_bands)
+            except Exception:
+                pass
 
         if is_playing:
             self._playing_indicator.setStyleSheet(f"color: {Colors.METER_LOW}; font-size: 16px;")

@@ -26,6 +26,7 @@ from eq_engine import EQEngine, EQParams
 from effect_engine import EffectEngine, EFFECT_PRESETS
 from geq_engine import GEQEngine, GEQParams
 import mic_engine
+from spectrum_engine import SpectrumManager
 
 
 # ------------------------------------------------------------------
@@ -212,6 +213,9 @@ class AudioEngine:
         # MICリアルタイム入力用チャンネル（トラックごと）
         self._mic_channels: Dict[int, Optional[object]] = {}
         self._mic_thread: Optional[threading.Thread] = None
+
+        # スペクトラムアナライザー用マネージャー
+        self._spectrum_manager = SpectrumManager(num_tracks=num_tracks)
 
         self._init_pygame()
 
@@ -561,6 +565,13 @@ class AudioEngine:
             out = geq_engine.apply_vectorized(out)
 
         out = np.clip(out, -1.0, 1.0)
+
+        # スペクトラムアナライザー用にFFTデータを更新
+        try:
+            self._spectrum_manager.push_chunk(track.track_id, out)
+        except Exception:
+            pass
+
         i16 = (out * 32767).astype(np.int16)
         return self._pygame.sndarray.make_sound(i16)
 
@@ -588,6 +599,18 @@ class AudioEngine:
     # ------------------------------------------------------------------
     # マスター音量
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # スペクトラムアナライザー
+    # ------------------------------------------------------------------
+
+    def get_spectrum_bands(self, track_id: int):
+        """指定トラックのスペクトルバンドデータ（0.0〜1.0 の ndarray）を返す。"""
+        return self._spectrum_manager.get_bands(track_id)
+
+    def reset_spectrum(self, track_id: int = None):
+        """スペクトルデータをリセットする。"""
+        self._spectrum_manager.reset(track_id)
 
     def set_master_volume(self, volume: float):
         """マスター音量を設定する（0.0〜1.5）。"""
