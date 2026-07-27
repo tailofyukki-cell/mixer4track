@@ -506,6 +506,52 @@ def test_gain_model():
 
 
 # ===========================================================================
+# 複数トラック同時再生テスト
+# ===========================================================================
+def test_multi_track_playback():
+    """複数トラックがそれぞれ別々のpygameチャンネルに割り当てられることを確認する。"""
+    import time
+    print("=== 複数トラック同時再生テスト ===")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 3トラック分のWAVを作成
+        wav_paths = []
+        for i in range(3):
+            path = os.path.join(tmpdir, f"track{i}.wav")
+            _make_wav(path, freq=440 + i * 110, duration=1.0)
+            wav_paths.append(path)
+
+        engine = AudioEngine(num_tracks=16)
+        if not engine._initialized:
+            print("  pygame未初期化のためskip")
+            return
+
+        tracks = [TrackModel(track_id=i) for i in range(3)]
+        for i, path in enumerate(wav_paths):
+            ok = engine.load_file(i, path)
+            assert ok, f"Track {i} 読み込み失敗"
+
+        engine.play_all(tracks)
+        time.sleep(0.2)  # ストリームループが走るまで待機
+
+        # 各トラックのチャンネルが別々のインデックスであることを確認
+        ch0 = engine._channels.get(0)
+        ch1 = engine._channels.get(1)
+        ch2 = engine._channels.get(2)
+        assert ch0 is not None, "Track 0 のチャンネルが割り当てられていない"
+        assert ch1 is not None, "Track 1 のチャンネルが割り当てられていない"
+        assert ch2 is not None, "Track 2 のチャンネルが割り当てられていない"
+
+        # 各チャンネルのインデックスが別々であることを確認
+        idx0 = ch0.get_sound() if hasattr(ch0, 'get_sound') else id(ch0)
+        assert ch0 is not ch1, f"Track 0とTrack 1が同じチャンネルを共有している"
+        assert ch1 is not ch2, f"Track 1とTrack 2が同じチャンネルを共有している"
+        assert ch0 is not ch2, f"Track 0とTrack 2が同じチャンネルを共有している"
+
+        engine.stop_all()
+    print("  複数トラック同時再生: OK")
+
+
+# ===========================================================================
 # build_windows.bat ASCII チェック
 # ===========================================================================
 def test_bat_ascii():
@@ -537,6 +583,7 @@ if __name__ == "__main__":
         test_effect_engine()
         test_project_store_effect()
         test_gain_model()
+        test_multi_track_playback()
         test_bat_ascii()
         print("\n=== 全テスト合格 ===")
         sys.exit(0)

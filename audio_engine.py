@@ -393,14 +393,17 @@ class AudioEngine:
 
         any_solo = any(t.solo for t in tracks)
 
-        # チャンネルを割り当て
+        # チャンネルを割り当て（インデックス直接指定で重複を防ぐ）
         channel_map: Dict[int, object] = {}
+        ch_index = 0
         for track in tracks:
             if streamers.get(track.track_id) is None:
                 continue
-            ch = self._pygame.mixer.find_channel(True)
-            if ch is None:
-                continue
+            if ch_index >= self.MAX_CHANNELS:
+                print(f"[AudioEngine] チャンネル上限({self.MAX_CHANNELS})に達しました")
+                break
+            ch = self._pygame.mixer.Channel(ch_index)
+            ch_index += 1
             channel_map[track.track_id] = ch
             with self._lock:
                 self._channels[track.track_id] = ch
