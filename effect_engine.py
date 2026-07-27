@@ -1,7 +1,14 @@
 """
-effect_engine.py — プリセットエフェクターエンジン（Phase 6）
+effect_engine.py — プリセットエフェクターエンジン（Phase 6 / Phase 11改）
 numpy only（scipy不要）で動作する6種エフェクト実装。
 全DSP処理をnumpyベクトル演算で実装し、Pythonループを排除して高速化。
+
+Phase 11改: ステートフル化（チャンク間バッファ保持）
+  - Reverb  : 残響テールを次チャンクに引き継ぐ（チャンク境界での途切れ解消）
+  - Delay   : リングバッファをチャンク間で保持（エコーの連続性を保証）
+  - Chorus  : LFO位相をチャンク間で保持（位相ジャンプ解消）
+  - Compressor: エンベロープ状態をチャンク間で保持
+  - Limiter / Distortion: ステートレス（変更なし）
 
 エフェクト一覧:
   Reverb      : 簡易FDN（コムフィルタ + オールパスフィルタ）
@@ -20,7 +27,7 @@ numpy only（scipy不要）で動作する6種エフェクト実装。
 import math
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -126,29 +133,125 @@ EFFECT_CATEGORIES = {
 
 
 # ---------------------------------------------------------------------------
-# EffectEngine: 各エフェクトのDSP処理（numpy vectorized）
+# EffectEngine: 各エフェクトのDSP処理（ステートフル・numpy vectorized）
 # ---------------------------------------------------------------------------
 
 class EffectEngine:
     """
-    プリセットエフェクターエンジン。
-    全処理をnumpyベクトル演算で実装し、Pythonループを排除して高速化。
+    プリセットエフェクターエンジン（ステートフル版）。
+    チャンク間で内部バッファを保持し、チャンク境界での音途切れを防ぐ。
+    エフェクト切り替え時はクロスフェードで滑らかに遷移する。
     """
+
+    # クロスフェード長（サンプル数）。20ms相当
+    CROSSFADE_SAMPLES = 882  # 44100 * 0.02
 
     def __init__(self, sample_rate: int = 44100):
         self._sr = sample_rate
+
+        # --- Reverb 内部状態 ---
+        # 各コムフィルタの残響テール（チャンク間で引き継ぐ）
+        self._reverb_tails: Dict[int, np.ndarray] = {}  # delay_idx -> tail array
+
+        # --- Delay 内部状態 ---
+        # リングバッファ（ステレオ）
+        self._delay_buf: Optional[np.ndarray] = None   # shape (buf_len, 2)
+        self._delay_write_pos: int = 0
+        self._delay_samp: int = 0
+
+        # --- Chorus 内部状態 ---
+        # LFO位相（チャンク間で継続）
+        self._chorus_phase: float = 0.0
+        # ディレイバッファ（ステレオ）
+        self._chorus_buf: Optional[np.ndarray] = None  # shape (max_delay+2, 2)
+        self._chorus_write_pos: int = 0
+        self._chorus_max_delay: int = 0
+
+        # --- Compressor 内部状態 ---
+        self._comp_env: float = 0.0  # エンベロープ状態
+
+        # --- クロスフェード状態 ---
+        self._prev_preset: str = "None"
+        self._crossfade_buf: Optional[np.ndarray] = None  # 前エフェクトの出力バッファ
+        self._crossfade_pos: int = 0  # クロスフェード進行位置（0=完了）
+
+    def reset_state(self):
+        """内部バッファをリセットする（トラック再生開始時に呼ぶ）。"""
+        self._reverb_tails = {}
+        self._delay_buf = None
+        self._delay_write_pos = 0
+        self._delay_samp = 0
+        self._chorus_phase = 0.0
+        self._chorus_buf = None
+        self._chorus_write_pos = 0
+        self._chorus_max_delay = 0
+        self._comp_env = 0.0
+        self._prev_preset = "None"
+        self._crossfade_buf = None
+        self._crossfade_pos = 0
 
     def apply(self, pcm: np.ndarray, preset_name: str) -> np.ndarray:
         """
         PCMバッファにエフェクトを適用して返す。
         pcm: shape (N, 2) float32, range -1.0〜+1.0
         戻り値: 同形状のfloat32配列
+        エフェクト切り替え時はクロスフェードで滑らかに遷移する。
         """
         if preset_name not in EFFECT_PRESETS:
             return pcm
         preset = EFFECT_PRESETS[preset_name]
+
+        # エフェクト切り替え検出
+        switching = (preset_name != self._prev_preset)
+        if switching:
+            # 前エフェクトの出力を保存してクロスフェード開始
+            prev_out = self._apply_preset(pcm, self._prev_preset)
+            self._crossfade_buf = prev_out
+            self._crossfade_pos = self.CROSSFADE_SAMPLES
+            # 内部バッファをリセット（新エフェクト用）
+            self._reset_stateful_buffers()
+            self._prev_preset = preset_name
+
+        # 新エフェクトを適用
+        out = self._apply_preset(pcm, preset_name)
+
+        # クロスフェード処理
+        if self._crossfade_pos > 0 and self._crossfade_buf is not None:
+            n = len(pcm)
+            fade_len = min(self._crossfade_pos, n)
+            fade_out = np.linspace(1.0, 1.0 - fade_len / self.CROSSFADE_SAMPLES,
+                                   fade_len, dtype=np.float32)
+            fade_in  = np.linspace(0.0, fade_len / self.CROSSFADE_SAMPLES,
+                                   fade_len, dtype=np.float32)
+            out[:fade_len, 0] = (self._crossfade_buf[:fade_len, 0] * fade_out
+                                 + out[:fade_len, 0] * fade_in)
+            out[:fade_len, 1] = (self._crossfade_buf[:fade_len, 1] * fade_out
+                                 + out[:fade_len, 1] * fade_in)
+            self._crossfade_pos = max(0, self._crossfade_pos - n)
+            if self._crossfade_pos == 0:
+                self._crossfade_buf = None
+
+        return out
+
+    def _reset_stateful_buffers(self):
+        """ステートフルバッファのみリセット（クロスフェード状態は保持）。"""
+        self._reverb_tails = {}
+        self._delay_buf = None
+        self._delay_write_pos = 0
+        self._delay_samp = 0
+        self._chorus_phase = 0.0
+        self._chorus_buf = None
+        self._chorus_write_pos = 0
+        self._chorus_max_delay = 0
+        self._comp_env = 0.0
+
+    def _apply_preset(self, pcm: np.ndarray, preset_name: str) -> np.ndarray:
+        """プリセット名に応じてエフェクトを適用する（内部用）。"""
+        if preset_name not in EFFECT_PRESETS:
+            return pcm.copy()
+        preset = EFFECT_PRESETS[preset_name]
         if preset.effect_type == "bypass":
-            return pcm
+            return pcm.copy()
 
         p = preset.params
         if preset.effect_type == "reverb":
@@ -169,15 +272,16 @@ class EffectEngine:
                                       p.get("depth_ms", 8.0), p.get("mix", 0.4))
         elif preset.effect_type == "limiter":
             return self._apply_limiter(pcm, p.get("ceiling_db", -3.0))
-        return pcm
+        return pcm.copy()
 
     # ------------------------------------------------------------------
-    # Reverb: FFT畳み込みによる高速リバーブ
+    # Reverb: ステートフル版（残響テールをチャンク間で引き継ぐ）
     # ------------------------------------------------------------------
     def _apply_reverb(self, pcm: np.ndarray, decay: float, mix: float) -> np.ndarray:
         """
-        簡易リバーブ（FFT畳み込み版）。
-        コムフィルタのインパルス応答を生成し、np.fft.rfftで高速畳み込み。
+        ステートフルリバーブ。
+        各コムフィルタの残響テールを内部バッファに保持し、
+        次チャンクの先頭に加算することでチャンク境界の途切れを解消する。
         """
         n_samples = len(pcm)
         mono = pcm.mean(axis=1).astype(np.float32)
@@ -185,46 +289,69 @@ class EffectEngine:
         comb_delays_ms = [29.7, 37.1, 41.1, 43.7]
         reverb_mono = np.zeros(n_samples, dtype=np.float32)
 
-        for d_ms in comb_delays_ms:
+        for d_idx, d_ms in enumerate(comb_delays_ms):
             d_samp = int(d_ms * self._sr / 1000)
             if d_samp < 1:
                 continue
 
-            # コムフィルタのインパルス応答を直接構築（反韻の重ね合わせ）
-            # 最大反韻回数を制限して高速化（-40dB以下で打ち切り）
+            # エコー回数を計算
             if decay >= 1.0:
                 n_echoes = 20
             else:
                 n_echoes = min(int(math.log(1e-2) / math.log(max(decay, 1e-9))), 40)
 
-            # インパルス応答 h[k*d_samp] = decay^k
-            ir_len = d_samp * n_echoes + 1
-            ir = np.zeros(ir_len, dtype=np.float32)
-            ir[0] = 1.0
+            # 前チャンクの残響テールを取得
+            tail = self._reverb_tails.get(d_idx)
+
+            # 現チャンクのコムフィルタ出力を計算
+            comb_out = np.zeros(n_samples, dtype=np.float32)
             coef = 1.0
             for k in range(1, n_echoes + 1):
                 offset = d_samp * k
-                if offset >= ir_len:
-                    break
                 coef *= decay
-                ir[offset] = coef
+                if offset < n_samples:
+                    # 現チャンク内のエコー
+                    comb_out[offset:] += mono[:n_samples - offset] * coef
+                else:
+                    # 次チャンクにはみ出すエコー（テールに保存）
+                    break
 
-            # FFT畳み込み（線形畳み込み）
-            conv_len = n_samples + ir_len - 1
-            fft_size = 1 << int(math.ceil(math.log2(conv_len)))  # 次の2のべき乗
-            X = np.fft.rfft(mono, n=fft_size)
-            H = np.fft.rfft(ir, n=fft_size)
-            comb_out = np.fft.irfft(X * H, n=fft_size)[:n_samples].astype(np.float32)
+            # 前チャンクのテールを現チャンクの先頭に加算
+            if tail is not None:
+                add_len = min(len(tail), n_samples)
+                comb_out[:add_len] += tail[:add_len]
+
+            # 次チャンク用のテールを計算・保存
+            # テール長 = 最大エコーオフセット - チャンク長
+            max_offset = d_samp * n_echoes
+            tail_len = min(max_offset, self._sr)  # 最大1秒分
+            new_tail = np.zeros(tail_len, dtype=np.float32)
+            coef = 1.0
+            for k in range(1, n_echoes + 1):
+                offset = d_samp * k
+                coef *= decay
+                # チャンクをはみ出す部分をテールに記録
+                if offset >= n_samples:
+                    tail_offset = offset - n_samples
+                    if tail_offset < tail_len:
+                        src_len = min(n_samples, tail_len - tail_offset)
+                        new_tail[tail_offset:tail_offset + src_len] += mono[:src_len] * coef
+                else:
+                    # チャンク内だが次チャンクにも響く
+                    remaining = n_samples - offset
+                    tail_src_len = min(remaining, tail_len)
+                    new_tail[:tail_src_len] += mono[offset:offset + tail_src_len] * coef
+
+            self._reverb_tails[d_idx] = new_tail
             reverb_mono += comb_out * 0.25
 
-        # オールパスフィルタ（短い遅延なのでインパルス応答が短く、FFT畳み込みが効果的）
+        # オールパスフィルタ
         allpass_delays_ms = [5.0, 1.7]
         g = 0.7
         for d_ms in allpass_delays_ms:
             d_samp = int(d_ms * self._sr / 1000)
             if d_samp < 1:
                 continue
-            # オールパス近似: 入力 + 遅延信号の加算
             ap_out = reverb_mono.copy() * (-g)
             ap_out[d_samp:] += reverb_mono[:n_samples - d_samp]
             ap_out[d_samp:] += ap_out[:n_samples - d_samp] * g
@@ -234,82 +361,78 @@ class EffectEngine:
         return ((1.0 - mix) * pcm + mix * wet).astype(np.float32)
 
     # ------------------------------------------------------------------
-    # Delay: numpy vectorized フィードバックディレイ
+    # Delay: ステートフル版（リングバッファをチャンク間で保持）
     # ------------------------------------------------------------------
     def _apply_delay(self, pcm: np.ndarray, delay_ms: float,
                      feedback: float, mix: float) -> np.ndarray:
         """
-        フィードバックディレイ（numpy vectorized版）。
-        フィードバックの反響を指数減衰の重ね合わせで計算。
+        ステートフルフィードバックディレイ。
+        リングバッファをチャンク間で保持し、チャンク境界でエコーが途切れない。
         """
         delay_samp = int(delay_ms * self._sr / 1000)
         if delay_samp < 1:
-            return pcm
+            return pcm.copy()
 
         n_samples = len(pcm)
         feedback = max(0.0, min(0.9, feedback))
 
-        wet = np.zeros_like(pcm)
+        # バッファサイズ変更検出（プリセット変更時）
+        buf_len = delay_samp + 1
+        if self._delay_buf is None or self._delay_samp != delay_samp:
+            self._delay_buf = np.zeros((buf_len, 2), dtype=np.float32)
+            self._delay_write_pos = 0
+            self._delay_samp = delay_samp
 
-        # フィードバック反響の最大回数（エネルギーが-60dB以下になるまで）
-        if feedback <= 0.0:
-            n_echoes = 0
-        elif feedback >= 1.0:
-            n_echoes = 50
-        else:
-            n_echoes = min(int(math.log(1e-3) / math.log(feedback)), 200)
+        buf = self._delay_buf
+        write_pos = self._delay_write_pos
+        out = np.zeros_like(pcm)
 
-        coef = 1.0
-        for k in range(1, n_echoes + 1):
-            offset = delay_samp * k
-            if offset >= n_samples:
-                break
-            coef *= feedback
-            wet[offset:] += pcm[:n_samples - offset] * coef
+        # サンプル単位でリングバッファを更新
+        for i in range(n_samples):
+            read_pos = (write_pos - delay_samp) % buf_len
+            delayed = buf[read_pos]
+            out[i] = pcm[i] * (1.0 - mix) + delayed * mix
+            buf[write_pos] = pcm[i] + delayed * feedback
+            write_pos = (write_pos + 1) % buf_len
 
-        return ((1.0 - mix) * pcm + mix * wet).astype(np.float32)
+        self._delay_write_pos = write_pos
+        return out.astype(np.float32)
 
     # ------------------------------------------------------------------
-    # Compressor: scipy.signal.lfilterによる高速エンベロープフォロワー
+    # Compressor: ステートフル版（エンベロープ状態をチャンク間で保持）
     # ------------------------------------------------------------------
     def _apply_compressor(self, pcm: np.ndarray, threshold_db: float,
                           ratio: float, attack_ms: float, release_ms: float) -> np.ndarray:
         """
-        RMSベースのコンプレッサー。
-        scipy利用可能な場合はlfilterで高速化、不可の場合はnumpyフォールバック。
+        ステートフルコンプレッサー。
+        エンベロープ状態をチャンク間で保持し、チャンク境界での急激なゲイン変化を防ぐ。
         """
         threshold_lin = 10 ** (threshold_db / 20.0)
-
         n_samples = len(pcm)
-        level = np.abs(pcm).mean(axis=1).astype(np.float32)
 
-        # エンベロープフォロワー：ダウンサンプリングで高速化
-        # コンプレッサーのアタック/リリースは通常数十ms単位なので、
-        # 1/8ダウンサンプリングしてエンベロープ計算、その後アップサンプリング
-        DS = 8  # ダウンサンプリング率
+        DS = 8
         sr_ds = self._sr / DS
         attack_coef  = math.exp(-1.0 / max(attack_ms  * sr_ds / 1000.0, 1.0))
         release_coef = math.exp(-1.0 / max(release_ms * sr_ds / 1000.0, 1.0))
 
-        # ダウンサンプリング: 各DSサンプルの最大値を取る
+        level = np.abs(pcm).mean(axis=1).astype(np.float32)
         n_ds = n_samples // DS
         level_ds = level[:n_ds * DS].reshape(n_ds, DS).max(axis=1).astype(np.float64)
 
-        # エンベロープフォロワー（ダウンサンプリング済み信号に対してループ）
+        # エンベロープフォロワー（前チャンクの状態から継続）
         env_ds = np.zeros(n_ds, dtype=np.float64)
-        e = 0.0
+        e = self._comp_env
         for i in range(n_ds):
             lv = level_ds[i]
             coef = attack_coef if lv > e else release_coef
             e = coef * e + (1.0 - coef) * lv
             env_ds[i] = e
+        self._comp_env = e  # 次チャンクに引き継ぐ
 
-        # アップサンプリング（線形補間）
         x_ds = np.arange(n_ds)
         x_full = np.linspace(0, n_ds - 1, n_samples)
         env = np.interp(x_full, x_ds, env_ds).astype(np.float64)
 
-        # ゲインリダクション（numpy vectorized）
         gain = np.ones(n_samples, dtype=np.float64)
         mask = env > threshold_lin
         if mask.any():
@@ -321,65 +444,75 @@ class EffectEngine:
         return out.astype(np.float32)
 
     # ------------------------------------------------------------------
-    # Distortion: tanhソフトクリッピング（完全vectorized）
+    # Distortion: tanhソフトクリッピング（ステートレス・変更なし）
     # ------------------------------------------------------------------
     def _apply_distortion(self, pcm: np.ndarray, drive: float, mix: float) -> np.ndarray:
         """
         tanhソフトクリッピングによるディストーション（完全numpy vectorized）。
+        ステートレスなので変更なし。
         """
         drive = max(1.0, drive)
         wet = np.tanh(pcm * drive) / math.tanh(drive)
         return ((1.0 - mix) * pcm + mix * wet).astype(np.float32)
 
     # ------------------------------------------------------------------
-    # Chorus: numpy vectorized LFO変調ディレイ（線形補間）
+    # Chorus: ステートフル版（LFO位相・ディレイバッファをチャンク間で保持）
     # ------------------------------------------------------------------
     def _apply_chorus(self, pcm: np.ndarray, rate_hz: float,
                       depth_ms: float, mix: float) -> np.ndarray:
         """
-        LFO変調ディレイによるコーラス（numpy vectorized版）。
-        LFOで変調したディレイインデックスをnp.take/advanced indexingで取得。
+        ステートフルコーラス。
+        LFO位相とディレイバッファをチャンク間で保持し、
+        チャンク境界での位相ジャンプと音途切れを解消する。
         """
         n_samples = len(pcm)
         depth_samp = depth_ms * self._sr / 1000.0
         if depth_samp < 1:
-            return pcm
+            return pcm.copy()
 
         max_delay = int(depth_samp * 2) + 4
-        wet = np.zeros_like(pcm)
 
-        # 時間軸ベクトル
-        t_idx = np.arange(n_samples, dtype=np.float64)
+        # ディレイバッファ初期化（サイズ変更時）
+        if self._chorus_buf is None or self._chorus_max_delay != max_delay:
+            self._chorus_buf = np.zeros((max_delay + 2, 2), dtype=np.float32)
+            self._chorus_write_pos = 0
+            self._chorus_max_delay = max_delay
 
-        for ch in range(2):
-            phase_offset = 0.0 if ch == 0 else math.pi * 0.5
-            # LFO変調量（サンプル数）
-            lfo = np.sin(2.0 * math.pi * rate_hz * t_idx / self._sr + phase_offset)
-            delay_samps = depth_samp * (1.0 + lfo)  # shape (N,)
+        buf = self._chorus_buf
+        buf_len = max_delay + 2
+        write_pos = self._chorus_write_pos
+        phase = self._chorus_phase
+        out = np.zeros_like(pcm)
 
-            # 読み出しインデックス（整数部・小数部）
-            read_float = t_idx - delay_samps
-            read_int   = np.floor(read_float).astype(np.int64)
-            frac       = (read_float - read_int).astype(np.float32)
+        # サンプル単位でLFO変調ディレイを処理
+        phase_inc = 2.0 * math.pi * rate_hz / self._sr
+        for i in range(n_samples):
+            for ch in range(2):
+                phase_offset = 0.0 if ch == 0 else math.pi * 0.5
+                lfo = math.sin(phase + phase_offset)
+                delay_s = depth_samp * (1.0 + lfo)
+                delay_int = int(delay_s)
+                frac = delay_s - delay_int
+                read_pos0 = (write_pos - delay_int) % buf_len
+                read_pos1 = (write_pos - delay_int - 1) % buf_len
+                delayed = buf[read_pos0, ch] * (1.0 - frac) + buf[read_pos1, ch] * frac
+                out[i, ch] = pcm[i, ch] * (1.0 - mix) + delayed * mix
+            buf[write_pos] = pcm[i]
+            write_pos = (write_pos + 1) % buf_len
+            phase += phase_inc
 
-            # パディング付き入力（負インデックスをゼロで埋める）
-            pad = max_delay + 2
-            padded = np.concatenate([np.zeros(pad, dtype=np.float32), pcm[:, ch]])
-            # インデックスをパディング分オフセット
-            idx0 = np.clip(read_int + pad, 0, len(padded) - 1)
-            idx1 = np.clip(read_int + pad + 1, 0, len(padded) - 1)
-
-            # 線形補間
-            wet[:, ch] = padded[idx0] * (1.0 - frac) + padded[idx1] * frac
-
-        return ((1.0 - mix) * pcm + mix * wet).astype(np.float32)
+        # 状態を保存
+        self._chorus_write_pos = write_pos
+        self._chorus_phase = phase % (2.0 * math.pi)  # オーバーフロー防止
+        return out.astype(np.float32)
 
     # ------------------------------------------------------------------
-    # Limiter: ハードリミッター（完全vectorized）
+    # Limiter: ハードリミッター（ステートレス・変更なし）
     # ------------------------------------------------------------------
     def _apply_limiter(self, pcm: np.ndarray, ceiling_db: float) -> np.ndarray:
         """
         ブリックウォールリミッター（完全numpy vectorized）。
+        ステートレスなので変更なし。
         """
         ceiling_lin = 10 ** (ceiling_db / 20.0)
         return np.clip(pcm, -ceiling_lin, ceiling_lin).astype(np.float32)

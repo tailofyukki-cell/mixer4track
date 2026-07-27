@@ -103,6 +103,9 @@ class _TrackStreamer:
         with self._lock:
             self._effect_preset = preset_name
             self._effect_enabled = enabled
+            # エフェクトが無効化された場合は内部バッファをリセット
+            if not enabled:
+                self._effect_engine.reset_state()
 
     # --- 再生位置 ---
 
