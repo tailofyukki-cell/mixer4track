@@ -98,6 +98,8 @@ class _TrackStreamer:
     def set_eq(self, params: EQParams):
         with self._lock:
             self._eq_params = params
+            # EQエンジンにパラメータ変更を通知（クロスフェード開始）
+            self._eq_engine.set_params(params)
 
     def set_effect(self, preset_name: str, enabled: bool):
         with self._lock:
@@ -148,9 +150,8 @@ class _TrackStreamer:
                 linear = 10.0 ** (self._gain_db / 20.0)
                 chunk = chunk * linear
 
-            # EQ適用
-            if not self._eq_params.is_flat():
-                self._eq_engine.set_params(self._eq_params)
+            # EQ適用（set_params は set_eq() 呼び出し時に実行済み）
+            if not self._eq_params.is_flat() or self._eq_engine._crossfade_pos > 0:
                 chunk = self._eq_engine.apply_eq(chunk)
 
             # エフェクト適用

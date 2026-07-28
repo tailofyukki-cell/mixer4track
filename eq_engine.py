@@ -1,5 +1,5 @@
 """
-eq_engine.py — 3バンドEQエンジン（Phase 5）
+eq_engine.py — 3バンドEQエンジン（Phase 5 / Phase 12改）
 自前Biquad IIRフィルタ（numpy only、scipy不要）
 
 バンド構成:
@@ -10,12 +10,17 @@ eq_engine.py — 3バンドEQエンジン（Phase 5）
 リアルタイム適用方式:
   apply_eq(pcm_float32_stereo) -> np.ndarray
   ※ 入力は shape (N, 2) の float32 配列（-1.0〜+1.0）
+
+Phase 12改: ステートフル化（チャンク間フィルタ状態保持）
+  - 各バンド・各チャンネルの IIR フィルタ状態（z1, z2）をチャンク間で保持
+  - EQパラメータ変更時（プリセット切り替え時）に20msクロスフェードで滑らかに遷移
+  - reset_state() メソッドを追加（トラック再生開始時に呼ぶ）
 """
 
 import math
 import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -168,23 +173,30 @@ def _peak_eq_sos(fc: float, gain_db: float, Q: float, sr: float) -> np.ndarray:
     return np.array([[b0/a0, b1/a0, b2/a0, 1.0, a1/a0, a2/a0]])
 
 
-def _sosfilt(sos: np.ndarray, x: np.ndarray) -> np.ndarray:
+def _sosfilt_stateful(sos: np.ndarray, x: np.ndarray,
+                      zi: np.ndarray) -> tuple:
     """
-    SOS形式のIIRフィルタを適用する（scipy不要・numpy vectorized実装）。
+    SOS形式のIIRフィルタを適用する（ステートフル版）。
     Direct Form II Transposed をnumpyで実装。
+
     sos: shape (n_sections, 6)  [b0, b1, b2, 1, a1, a2]
     x:   shape (N,) float64
+    zi:  shape (n_sections, 2) float64  各セクションの [z1, z2] 状態
+
+    戻り値: (y, zo)
+      y:  shape (N,) float64  フィルタ出力
+      zo: shape (n_sections, 2) float64  更新後の状態
     """
     y = x.astype(np.float64)
-    for section in sos:
-        b0, b1, b2, _, a1, a2 = section
-        # Direct Form II Transposed: サンプル単位ループをnumpyで高速化
-        # 再帰的な依存があるため完全ベクトル化は不可だが
-        # numpy配列アクセスでPythonオーバーヘッドを削減
+    n_sections = sos.shape[0]
+    zo = np.zeros((n_sections, 2), dtype=np.float64)
+
+    for s_idx in range(n_sections):
+        b0, b1, b2, _, a1, a2 = sos[s_idx]
+        z1 = float(zi[s_idx, 0])
+        z2 = float(zi[s_idx, 1])
         N = len(y)
         out = np.empty(N, dtype=np.float64)
-        z1, z2 = 0.0, 0.0
-        # numpy配列として一括読み込み（メモリアクセス高速化）
         y_arr = y
         for i in range(N):
             xi = y_arr[i]
@@ -192,52 +204,157 @@ def _sosfilt(sos: np.ndarray, x: np.ndarray) -> np.ndarray:
             z1 = b1 * xi - a1 * yi + z2
             z2 = b2 * xi - a2 * yi
             out[i] = yi
+        zo[s_idx, 0] = z1
+        zo[s_idx, 1] = z2
         y = out
-    return y
+
+    return y, zo
 
 
-def _sosfilt_scipy_fallback(sos: np.ndarray, x: np.ndarray) -> np.ndarray:
+def _sosfilt_scipy_stateful(sos: np.ndarray, x: np.ndarray,
+                             zi: np.ndarray) -> tuple:
     """
-    scipy.signal.sosfilt が利用可能な場合はそちらを使う高速版。
-    利用不可の場合は _sosfilt にフォールバック。
+    scipy.signal.sosfilt が利用可能な場合はそちらを使う高速版（ステートフル）。
+    利用不可の場合は _sosfilt_stateful にフォールバック。
+
+    zi: shape (n_sections, 2)  各セクションの [z1, z2] 状態
+    戻り値: (y, zo)
     """
     try:
         from scipy.signal import sosfilt as scipy_sosfilt
-        return scipy_sosfilt(sos, x.astype(np.float64))
+        # scipy の sosfilt は zi shape (n_sections, 2) を受け付ける
+        y, zo = scipy_sosfilt(sos, x.astype(np.float64), zi=zi)
+        return y, zo
     except ImportError:
-        return _sosfilt(sos, x)
+        return _sosfilt_stateful(sos, x, zi)
 
 
 # ---------------------------------------------------------------------------
-# EQエンジン
+# EQエンジン（ステートフル版）
 # ---------------------------------------------------------------------------
 
 class EQEngine:
     """
-    1トラック分のEQ処理エンジン。
+    1トラック分のEQ処理エンジン（ステートフル版）。
     apply_eq() で numpy float32 stereo バッファにEQを適用する。
+
+    Phase 12改:
+    - 各バンド・各チャンネルのフィルタ状態（z1, z2）をチャンク間で保持
+    - EQパラメータ変更時（プリセット切り替え時）に20msクロスフェードで遷移
     """
+
+    # クロスフェード長（サンプル数）。20ms相当
+    CROSSFADE_SAMPLES = 882  # 44100 * 0.02
+
+    # フィルタバンド数（Low / Mid / High の3バンド）
+    N_BANDS = 3
+    # ステレオチャンネル数
+    N_CH = 2
 
     def __init__(self, sample_rate: int = 44100):
         self._sr = sample_rate
         self._params = EQParams()
+
+        # フィルタ状態バッファ: shape (N_BANDS, N_CH, 1, 2)
+        # [band_idx, ch_idx, section_idx=0, z1/z2]
+        self._filter_zi = np.zeros((self.N_BANDS, self.N_CH, 1, 2), dtype=np.float64)
+
+        # 前チャンクの最後のサンプル値（ステレオ）
+        # クロスフェード開始時のフェードアウト開始値として使う
+        self._prev_last_sample = np.zeros(2, dtype=np.float32)
+
+        # クロスフェード状態
+        self._crossfade_buf: Optional[np.ndarray] = None  # 前EQの出力バッファ（フェードアウト用）
+        self._crossfade_pos: int = 0  # クロスフェード進行位置（0=完了）
 
     @property
     def params(self) -> EQParams:
         return self._params
 
     def set_params(self, params: EQParams):
+        """EQパラメータを変更する。パラメータが変化した場合はクロスフェードを開始する。"""
         params.clamp()
+        # パラメータが実質的に変化している場合のみクロスフェード開始
+        old = self._params
+        changed = (
+            abs(old.low_gain_db  - params.low_gain_db)  > 0.01 or
+            abs(old.mid_gain_db  - params.mid_gain_db)  > 0.01 or
+            abs(old.mid_freq_hz  - params.mid_freq_hz)  > 1.0  or
+            abs(old.mid_q        - params.mid_q)        > 0.01 or
+            abs(old.high_gain_db - params.high_gain_db) > 0.01
+        )
+        if changed:
+            # 前チャンクの最後のサンプル値から始まるフェードアウトバッファを生成
+            # これにより切り替え直後のジャンプ（プチ音）を防ぐ
+            cf_len = self.CROSSFADE_SAMPLES
+            self._crossfade_buf = np.zeros((cf_len, 2), dtype=np.float32)
+            # 前の最後のサンプル値からゼロへのフェードアウト
+            fade_out = np.linspace(1.0, 0.0, cf_len, dtype=np.float32)
+            self._crossfade_buf[:, 0] = self._prev_last_sample[0] * fade_out
+            self._crossfade_buf[:, 1] = self._prev_last_sample[1] * fade_out
+            self._crossfade_pos = cf_len
+            # フィルタ状態をリセット（新パラメータ用）
+            self._filter_zi[:] = 0.0
         self._params = params
+
+    def reset_state(self):
+        """内部バッファをリセットする（トラック再生開始時に呼ぶ）。"""
+        self._filter_zi[:] = 0.0
+        self._prev_last_sample[:] = 0.0
+        self._crossfade_buf = None
+        self._crossfade_pos = 0
 
     def apply_eq(self, pcm: np.ndarray) -> np.ndarray:
         """
-        EQを適用する。
+        EQを適用する（ステートフル版）。
         pcm: shape (N, 2) float32 stereo, range -1.0〜+1.0
         戻り値: 同じ shape の float32 配列
         """
+        if self._params.is_flat() and self._crossfade_pos == 0:
+            # フラット時かつクロスフェード不要はバイパス
+            # 前サンプル値を更新
+            self._prev_last_sample = pcm[-1].copy().astype(np.float32)
+            return pcm
+
+        # 新パラメータでEQを適用
+        out = self._apply_eq_stateful(pcm)
+
+        # 前サンプル値を更新（次回のクロスフェード開始値用）
+        self._prev_last_sample = out[-1].copy().astype(np.float32)
+
+        # クロスフェード処理
+        if self._crossfade_pos > 0 and self._crossfade_buf is not None:
+            n = len(pcm)
+            fade_len = min(self._crossfade_pos, n)
+            cf_start = self.CROSSFADE_SAMPLES - self._crossfade_pos
+
+            # フェードアウト（旧出力）とフェードイン（新出力）
+            fade_in = np.linspace(
+                cf_start / self.CROSSFADE_SAMPLES,
+                (cf_start + fade_len) / self.CROSSFADE_SAMPLES,
+                fade_len, dtype=np.float32
+            )
+            fade_in = np.clip(fade_in, 0.0, 1.0)
+            fade_out = 1.0 - fade_in
+
+            out[:fade_len, 0] = (self._crossfade_buf[cf_start:cf_start + fade_len, 0] * fade_out
+                                 + out[:fade_len, 0] * fade_in)
+            out[:fade_len, 1] = (self._crossfade_buf[cf_start:cf_start + fade_len, 1] * fade_out
+                                 + out[:fade_len, 1] * fade_in)
+            self._crossfade_pos = max(0, self._crossfade_pos - n)
+            if self._crossfade_pos == 0:
+                self._crossfade_buf = None
+
+        return out
+
+    def _apply_eq_stateful(self, pcm: np.ndarray) -> np.ndarray:
+        """
+        フィルタ状態を保持しながらEQを適用する（内部用）。
+        pcm: shape (N, 2) float32
+        戻り値: shape (N, 2) float32
+        """
         if self._params.is_flat():
-            return pcm  # フラット時はバイパス
+            return pcm.astype(np.float32)
 
         p = self._params
         result = pcm.astype(np.float64)
@@ -246,20 +363,26 @@ class EQEngine:
         for ch in range(result.shape[1]):
             sig = result[:, ch]
 
-            # Low shelf
+            # Low shelf (band_idx=0)
             if abs(p.low_gain_db) > 0.01:
                 sos = _low_shelf_sos(p.LOW_FC, p.low_gain_db, self._sr)
-                sig = _sosfilt_scipy_fallback(sos, sig)
+                zi = self._filter_zi[0, ch]  # shape (1, 2)
+                sig, zo = _sosfilt_scipy_stateful(sos, sig, zi)
+                self._filter_zi[0, ch] = zo
 
-            # Mid peak
+            # Mid peak (band_idx=1)
             if abs(p.mid_gain_db) > 0.01:
                 sos = _peak_eq_sos(p.mid_freq_hz, p.mid_gain_db, p.mid_q, self._sr)
-                sig = _sosfilt_scipy_fallback(sos, sig)
+                zi = self._filter_zi[1, ch]  # shape (1, 2)
+                sig, zo = _sosfilt_scipy_stateful(sos, sig, zi)
+                self._filter_zi[1, ch] = zo
 
-            # High shelf
+            # High shelf (band_idx=2)
             if abs(p.high_gain_db) > 0.01:
                 sos = _high_shelf_sos(p.HIGH_FC, p.high_gain_db, self._sr)
-                sig = _sosfilt_scipy_fallback(sos, sig)
+                zi = self._filter_zi[2, ch]  # shape (1, 2)
+                sig, zo = _sosfilt_scipy_stateful(sos, sig, zi)
+                self._filter_zi[2, ch] = zo
 
             result[:, ch] = sig
 
@@ -267,7 +390,7 @@ class EQEngine:
 
     def apply_eq_mono(self, pcm_mono: np.ndarray) -> np.ndarray:
         """
-        モノラル信号にEQを適用する。
+        モノラル信号にEQを適用する（ステートフル版）。
         pcm_mono: shape (N,) float32
         戻り値: shape (N,) float32
         """
@@ -277,17 +400,24 @@ class EQEngine:
         p = self._params
         sig = pcm_mono.astype(np.float64)
 
+        # モノラル用フィルタ状態（ch=0 を流用）
         if abs(p.low_gain_db) > 0.01:
             sos = _low_shelf_sos(p.LOW_FC, p.low_gain_db, self._sr)
-            sig = _sosfilt_scipy_fallback(sos, sig)
+            zi = self._filter_zi[0, 0]
+            sig, zo = _sosfilt_scipy_stateful(sos, sig, zi)
+            self._filter_zi[0, 0] = zo
 
         if abs(p.mid_gain_db) > 0.01:
             sos = _peak_eq_sos(p.mid_freq_hz, p.mid_gain_db, p.mid_q, self._sr)
-            sig = _sosfilt_scipy_fallback(sos, sig)
+            zi = self._filter_zi[1, 0]
+            sig, zo = _sosfilt_scipy_stateful(sos, sig, zi)
+            self._filter_zi[1, 0] = zo
 
         if abs(p.high_gain_db) > 0.01:
             sos = _high_shelf_sos(p.HIGH_FC, p.high_gain_db, self._sr)
-            sig = _sosfilt_scipy_fallback(sos, sig)
+            zi = self._filter_zi[2, 0]
+            sig, zo = _sosfilt_scipy_stateful(sos, sig, zi)
+            self._filter_zi[2, 0] = zo
 
         return sig.astype(np.float32)
 
