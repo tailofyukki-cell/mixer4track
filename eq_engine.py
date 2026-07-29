@@ -22,6 +22,14 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
+# scipy.signal.sosfilt をモジュールレベルで事前インポート（初回遅延を防ぐ）
+try:
+    from scipy.signal import sosfilt as _scipy_sosfilt
+    _SCIPY_AVAILABLE = True
+except ImportError:
+    _scipy_sosfilt = None
+    _SCIPY_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # EQパラメータ
@@ -185,7 +193,7 @@ def _sosfilt_stateful(sos: np.ndarray, x: np.ndarray,
 
     戻り値: (y, zo)
       y:  shape (N,) float64  フィルタ出力
-      zo: shape (n_sections, 2) float64  更新後の状態
+      zo: shape (n_sections, 2) float64  更後の状態
     """
     y = x.astype(np.float64)
     n_sections = sos.shape[0]
@@ -197,9 +205,9 @@ def _sosfilt_stateful(sos: np.ndarray, x: np.ndarray,
         z2 = float(zi[s_idx, 1])
         N = len(y)
         out = np.empty(N, dtype=np.float64)
-        y_arr = y
+        # Direct Form II Transposed: 各サンプルを順次処理（依存関係上ベクトル化不可）
         for i in range(N):
-            xi = y_arr[i]
+            xi = y[i]
             yi = b0 * xi + z1
             z1 = b1 * xi - a1 * yi + z2
             z2 = b2 * xi - a2 * yi
@@ -247,12 +255,11 @@ def _sosfilt_scipy_stateful(sos: np.ndarray, x: np.ndarray,
     zi: shape (n_sections, 2)  各セクションの [z1, z2] 状態
     戻り値: (y, zo)
     """
-    try:
-        from scipy.signal import sosfilt as scipy_sosfilt
+    if _SCIPY_AVAILABLE:
         # scipy の sosfilt は zi shape (n_sections, 2) を受け付ける
-        y, zo = scipy_sosfilt(sos, x.astype(np.float64), zi=zi)
+        y, zo = _scipy_sosfilt(sos, x.astype(np.float64), zi=zi)
         return y, zo
-    except ImportError:
+    else:
         return _sosfilt_stateful(sos, x, zi)
 
 
@@ -292,6 +299,9 @@ class EQEngine:
         # クロスフェード状態
         self._crossfade_pos: int = 0  # クロスフェード残りサンプル数（0=完了）
 
+        # 最後のサンプル値（定常状態初期化に使用）
+        self._prev_last_sample = np.zeros(self.N_CH, dtype=np.float32)
+
     @property
     def params(self) -> EQParams:
         return self._params
@@ -320,40 +330,28 @@ class EQEngine:
 
     def _init_new_filter_zi(self, params: EQParams):
         """新EQフィルタの初期状態を定常状態で初期化する。
-        旧フィルタの最後出力値を定常入力と仮定して計算する。"""
+        _prev_last_sample（前チャンクの最後出力値）を定常入力として計算する。"""
         p = params
         self._filter_zi[:] = 0.0
         if p.is_flat():
             return
-        # 旧フィルタの最後出力値を定常入力として新フィルタの定常状態を計算
-        # _old_filter_ziの最後状態から推定するのは複雑なので、
-        # 「現在のフィルタ出力の最後値」を定常入力として使用する
-        # 旧フィルタの最後状態 z1[0,ch] から出力値を推定
+        # _prev_last_sample（前チャンクの最後出力値）を定常入力として
+        # 新フィルタの定常状態初期値を計算する。
+        # Flat状態では _prev_last_sample = 最後の入力サンプル値が保存されている。
         for ch in range(self.N_CH):
-            # 旧EQの最後出力値を推定：旧フィルタの z1 が「次の入力に対する待機値」
-            # Direct Form II Transposed: y[n] = b0*x[n] + z1[n-1]
-            # z1 は「前回の入力に対する待機値」なので、
-            # 最後出力値 ≈ _old_filter_zi[0, ch, 0, 0] + b0 * 最後入力
-            # 簡単化：旧フィルタの最後出力値を 0.0 と仮定して定常状態初期化
-            # （実際の最後出力値はクロスフェードにより补完される）
+            x0 = float(self._prev_last_sample[ch])
             if abs(p.low_gain_db) > 0.01:
                 sos = _low_shelf_sos(p.LOW_FC, p.low_gain_db, self._sr)
-                # 旧フィルタの最後出力値を定常入力として使用
-                # z1[0,ch,0,0] は「前回の入力に対する待機値」なので
-                # 最後出力値 ≈ z1 として定常状態を計算
-                x0 = float(self._old_filter_zi[0, ch, 0, 0])
                 zi_ss = _sosfilt_steady_state_zi(sos, x0)
                 self._filter_zi[0, ch] = zi_ss
 
             if abs(p.mid_gain_db) > 0.01:
                 sos = _peak_eq_sos(p.mid_freq_hz, p.mid_gain_db, p.mid_q, self._sr)
-                x0 = float(self._old_filter_zi[1, ch, 0, 0])
                 zi_ss = _sosfilt_steady_state_zi(sos, x0)
                 self._filter_zi[1, ch] = zi_ss
 
             if abs(p.high_gain_db) > 0.01:
                 sos = _high_shelf_sos(p.HIGH_FC, p.high_gain_db, self._sr)
-                x0 = float(self._old_filter_zi[2, ch, 0, 0])
                 zi_ss = _sosfilt_steady_state_zi(sos, x0)
                 self._filter_zi[2, ch] = zi_ss
 
@@ -363,6 +361,7 @@ class EQEngine:
         self._old_filter_zi[:] = 0.0
         self._old_params = None
         self._crossfade_pos = 0
+        self._prev_last_sample[:] = 0.0
 
     def apply_eq(self, pcm: np.ndarray) -> np.ndarray:
         """
@@ -372,6 +371,9 @@ class EQEngine:
         """
         if self._params.is_flat() and self._crossfade_pos == 0:
             # フラットかつクロスフェード不要はバイパス
+            # 次回の定常状態初期化のために最後のサンプル値を保存
+            if len(pcm) > 0:
+                self._prev_last_sample[:] = pcm[-1]
             return pcm
 
         # クロスフェード処理：旧EQ出力と新EQ出力をブレンド
@@ -447,7 +449,11 @@ class EQEngine:
 
             result[:, ch] = sig
 
-        return result.astype(np.float32)
+        out = result.astype(np.float32)
+        # 次回の定常状態初期化のために最後のサンプル値を保存
+        if len(out) > 0:
+            self._prev_last_sample[:] = out[-1]
+        return out
 
     def _apply_eq_with_params(self, pcm: np.ndarray, params: EQParams,
                                zi: np.ndarray) -> np.ndarray:
