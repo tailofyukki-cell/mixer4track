@@ -150,9 +150,8 @@ class _TrackStreamer:
                 linear = 10.0 ** (self._gain_db / 20.0)
                 chunk = chunk * linear
 
-            # EQ適用（set_params は set_eq() 呼び出し時に実行済み）
-            if not self._eq_params.is_flat() or self._eq_engine._crossfade_pos > 0:
-                chunk = self._eq_engine.apply_eq(chunk)
+            # EQ適用（常に apply_eq を呼び、内部で Flat 時はバイパスしつつ _prev_last_sample を更新する）
+            chunk = self._eq_engine.apply_eq(chunk)
 
             # エフェクト適用
             if self._effect_enabled and self._effect_preset != "None":
