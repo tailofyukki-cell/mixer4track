@@ -457,7 +457,7 @@ class AudioEngine:
                 time.sleep(CHUNK_SEC * QUEUE_AHEAD + 0.1)
                 break
 
-            time.sleep(CHUNK_SEC * 0.25)  # ポーリング間隔
+            time.sleep(CHUNK_SEC * 0.05)  # ポーリング間隔（4ms）：キュー空白を最小化
 
         self._playing = False
 

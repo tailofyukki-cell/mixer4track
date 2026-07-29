@@ -211,6 +211,33 @@ def _sosfilt_stateful(sos: np.ndarray, x: np.ndarray,
     return y, zo
 
 
+def _sosfilt_steady_state_zi(sos: np.ndarray, x0: float) -> np.ndarray:
+    """
+    Direct Form II Transposed の定常状態初期値を計算する。
+    定常入力 x[n] = x0 に対する定常状態の z1, z2 を返す。
+    sos: shape (n_sections, 6)
+    戻り値: shape (n_sections, 2)  各セクションの [z1_ss, z2_ss]
+    """
+    n_sections = sos.shape[0]
+    zi = np.zeros((n_sections, 2), dtype=np.float64)
+    cur_x0 = x0
+    for s_idx in range(n_sections):
+        b0, b1, b2, _, a1, a2 = sos[s_idx]
+        denom = 1.0 + a1 + a2
+        if abs(denom) < 1e-12:
+            # 不安定なフィルタ：ゼロ初期化
+            zi[s_idx] = 0.0
+            cur_x0 = cur_x0 * (b0 + b1 + b2)
+        else:
+            y0 = cur_x0 * (b0 + b1 + b2) / denom
+            z2_ss = b2 * cur_x0 - a2 * y0
+            z1_ss = b1 * cur_x0 - a1 * y0 + z2_ss
+            zi[s_idx, 0] = z1_ss
+            zi[s_idx, 1] = z2_ss
+            cur_x0 = y0  # 次のセクションの入力はこのセクションの出力
+    return zi
+
+
 def _sosfilt_scipy_stateful(sos: np.ndarray, x: np.ndarray,
                              zi: np.ndarray) -> tuple:
     """
@@ -255,24 +282,22 @@ class EQEngine:
         self._sr = sample_rate
         self._params = EQParams()
 
-        # フィルタ状態バッファ: shape (N_BANDS, N_CH, 1, 2)
-        # [band_idx, ch_idx, section_idx=0, z1/z2]
+        # 新パラメータ用フィルタ状態: shape (N_BANDS, N_CH, 1, 2)
         self._filter_zi = np.zeros((self.N_BANDS, self.N_CH, 1, 2), dtype=np.float64)
 
-        # 前チャンクの最後のサンプル値（ステレオ）
-        # クロスフェード開始時のフェードアウト開始値として使う
-        self._prev_last_sample = np.zeros(2, dtype=np.float32)
+        # クロスフェード用：旧パラメータと旧フィルタ状態を保持
+        self._old_params: Optional[EQParams] = None
+        self._old_filter_zi = np.zeros((self.N_BANDS, self.N_CH, 1, 2), dtype=np.float64)
 
         # クロスフェード状態
-        self._crossfade_buf: Optional[np.ndarray] = None  # 前EQの出力バッファ（フェードアウト用）
-        self._crossfade_pos: int = 0  # クロスフェード進行位置（0=完了）
+        self._crossfade_pos: int = 0  # クロスフェード残りサンプル数（0=完了）
 
     @property
     def params(self) -> EQParams:
         return self._params
 
     def set_params(self, params: EQParams):
-        """EQパラメータを変更する。パラメータが変化した場合はクロスフェードを開始する。"""
+        """イコライザーパラメータを変更する。パラメータが変化した場合はクロスフェードを開始する。"""
         params.clamp()
         # パラメータが実質的に変化している場合のみクロスフェード開始
         old = self._params
@@ -284,68 +309,104 @@ class EQEngine:
             abs(old.high_gain_db - params.high_gain_db) > 0.01
         )
         if changed:
-            # 前チャンクの最後のサンプル値から始まるフェードアウトバッファを生成
-            # これにより切り替え直後のジャンプ（プチ音）を防ぐ
-            cf_len = self.CROSSFADE_SAMPLES
-            self._crossfade_buf = np.zeros((cf_len, 2), dtype=np.float32)
-            # 前の最後のサンプル値からゼロへのフェードアウト
-            fade_out = np.linspace(1.0, 0.0, cf_len, dtype=np.float32)
-            self._crossfade_buf[:, 0] = self._prev_last_sample[0] * fade_out
-            self._crossfade_buf[:, 1] = self._prev_last_sample[1] * fade_out
-            self._crossfade_pos = cf_len
-            # フィルタ状態をリセット（新パラメータ用）
-            self._filter_zi[:] = 0.0
+            # 旧パラメータと旧フィルタ状態を保存（クロスフェード中に旧EQで処理するため）
+            self._old_params = old
+            self._old_filter_zi = self._filter_zi.copy()
+            self._crossfade_pos = self.CROSSFADE_SAMPLES
+            # 新パラメータ用フィルタ状態を「旧出力の最後値」で定常状態初期化
+            # これにより新EQフィルタの過渡応答による音途切れを防ぐ
+            self._init_new_filter_zi(params)
         self._params = params
+
+    def _init_new_filter_zi(self, params: EQParams):
+        """新EQフィルタの初期状態を定常状態で初期化する。
+        旧フィルタの最後出力値を定常入力と仮定して計算する。"""
+        p = params
+        self._filter_zi[:] = 0.0
+        if p.is_flat():
+            return
+        # 旧フィルタの最後出力値を定常入力として新フィルタの定常状態を計算
+        # _old_filter_ziの最後状態から推定するのは複雑なので、
+        # 「現在のフィルタ出力の最後値」を定常入力として使用する
+        # 旧フィルタの最後状態 z1[0,ch] から出力値を推定
+        for ch in range(self.N_CH):
+            # 旧EQの最後出力値を推定：旧フィルタの z1 が「次の入力に対する待機値」
+            # Direct Form II Transposed: y[n] = b0*x[n] + z1[n-1]
+            # z1 は「前回の入力に対する待機値」なので、
+            # 最後出力値 ≈ _old_filter_zi[0, ch, 0, 0] + b0 * 最後入力
+            # 簡単化：旧フィルタの最後出力値を 0.0 と仮定して定常状態初期化
+            # （実際の最後出力値はクロスフェードにより补完される）
+            if abs(p.low_gain_db) > 0.01:
+                sos = _low_shelf_sos(p.LOW_FC, p.low_gain_db, self._sr)
+                # 旧フィルタの最後出力値を定常入力として使用
+                # z1[0,ch,0,0] は「前回の入力に対する待機値」なので
+                # 最後出力値 ≈ z1 として定常状態を計算
+                x0 = float(self._old_filter_zi[0, ch, 0, 0])
+                zi_ss = _sosfilt_steady_state_zi(sos, x0)
+                self._filter_zi[0, ch] = zi_ss
+
+            if abs(p.mid_gain_db) > 0.01:
+                sos = _peak_eq_sos(p.mid_freq_hz, p.mid_gain_db, p.mid_q, self._sr)
+                x0 = float(self._old_filter_zi[1, ch, 0, 0])
+                zi_ss = _sosfilt_steady_state_zi(sos, x0)
+                self._filter_zi[1, ch] = zi_ss
+
+            if abs(p.high_gain_db) > 0.01:
+                sos = _high_shelf_sos(p.HIGH_FC, p.high_gain_db, self._sr)
+                x0 = float(self._old_filter_zi[2, ch, 0, 0])
+                zi_ss = _sosfilt_steady_state_zi(sos, x0)
+                self._filter_zi[2, ch] = zi_ss
 
     def reset_state(self):
         """内部バッファをリセットする（トラック再生開始時に呼ぶ）。"""
         self._filter_zi[:] = 0.0
-        self._prev_last_sample[:] = 0.0
-        self._crossfade_buf = None
+        self._old_filter_zi[:] = 0.0
+        self._old_params = None
         self._crossfade_pos = 0
 
     def apply_eq(self, pcm: np.ndarray) -> np.ndarray:
         """
         EQを適用する（ステートフル版）。
-        pcm: shape (N, 2) float32 stereo, range -1.0〜+1.0
+        pcm: shape (N, 2) float32 stereo, range -1.0～+1.0
         戻り値: 同じ shape の float32 配列
         """
         if self._params.is_flat() and self._crossfade_pos == 0:
-            # フラット時かつクロスフェード不要はバイパス
-            # 前サンプル値を更新
-            self._prev_last_sample = pcm[-1].copy().astype(np.float32)
+            # フラットかつクロスフェード不要はバイパス
             return pcm
 
-        # 新パラメータでEQを適用
-        out = self._apply_eq_stateful(pcm)
-
-        # 前サンプル値を更新（次回のクロスフェード開始値用）
-        self._prev_last_sample = out[-1].copy().astype(np.float32)
-
-        # クロスフェード処理
-        if self._crossfade_pos > 0 and self._crossfade_buf is not None:
+        # クロスフェード処理：旧EQ出力と新EQ出力をブレンド
+        if self._crossfade_pos > 0 and self._old_params is not None:
             n = len(pcm)
             fade_len = min(self._crossfade_pos, n)
             cf_start = self.CROSSFADE_SAMPLES - self._crossfade_pos
 
-            # フェードアウト（旧出力）とフェードイン（新出力）
+            # 旧パラメータで実際に処理した出力（フェードアウト側）
+            old_out = self._apply_eq_with_params(
+                pcm[:fade_len], self._old_params, self._old_filter_zi
+            )
+            # 新パラメータでEQを適用（フェードイン側）
+            out = self._apply_eq_stateful(pcm)
+
             fade_in = np.linspace(
                 cf_start / self.CROSSFADE_SAMPLES,
                 (cf_start + fade_len) / self.CROSSFADE_SAMPLES,
                 fade_len, dtype=np.float32
             )
             fade_in = np.clip(fade_in, 0.0, 1.0)
-            fade_out = 1.0 - fade_in
+            fade_out_w = 1.0 - fade_in
 
-            out[:fade_len, 0] = (self._crossfade_buf[cf_start:cf_start + fade_len, 0] * fade_out
-                                 + out[:fade_len, 0] * fade_in)
-            out[:fade_len, 1] = (self._crossfade_buf[cf_start:cf_start + fade_len, 1] * fade_out
-                                 + out[:fade_len, 1] * fade_in)
+            # 旧EQ出力 × fade_out + 新EQ出力 × fade_in
+            out[:fade_len, 0] = old_out[:, 0] * fade_out_w + out[:fade_len, 0] * fade_in
+            out[:fade_len, 1] = old_out[:, 1] * fade_out_w + out[:fade_len, 1] * fade_in
+
             self._crossfade_pos = max(0, self._crossfade_pos - n)
             if self._crossfade_pos == 0:
-                self._crossfade_buf = None
+                self._old_params = None
 
-        return out
+            return out
+
+        # 通常処理（クロスフェードなし）
+        return self._apply_eq_stateful(pcm)
 
     def _apply_eq_stateful(self, pcm: np.ndarray) -> np.ndarray:
         """
@@ -383,6 +444,42 @@ class EQEngine:
                 zi = self._filter_zi[2, ch]  # shape (1, 2)
                 sig, zo = _sosfilt_scipy_stateful(sos, sig, zi)
                 self._filter_zi[2, ch] = zo
+
+            result[:, ch] = sig
+
+        return result.astype(np.float32)
+
+    def _apply_eq_with_params(self, pcm: np.ndarray, params: EQParams,
+                               zi: np.ndarray) -> np.ndarray:
+        """
+        指定パラメータとフィルタ状態でEQを適用する（クロスフェード旧EQ用）。
+        ziは内部で更新される（旧フィルタ状態を進行させる）。
+        pcm: shape (N, 2) float32
+        戻り値: shape (N, 2) float32
+        """
+        if params.is_flat():
+            return pcm.astype(np.float32)
+
+        p = params
+        result = pcm.astype(np.float64)
+
+        for ch in range(result.shape[1]):
+            sig = result[:, ch]
+
+            if abs(p.low_gain_db) > 0.01:
+                sos = _low_shelf_sos(p.LOW_FC, p.low_gain_db, self._sr)
+                sig, zo = _sosfilt_scipy_stateful(sos, sig, zi[0, ch])
+                zi[0, ch] = zo
+
+            if abs(p.mid_gain_db) > 0.01:
+                sos = _peak_eq_sos(p.mid_freq_hz, p.mid_gain_db, p.mid_q, self._sr)
+                sig, zo = _sosfilt_scipy_stateful(sos, sig, zi[1, ch])
+                zi[1, ch] = zo
+
+            if abs(p.high_gain_db) > 0.01:
+                sos = _high_shelf_sos(p.HIGH_FC, p.high_gain_db, self._sr)
+                sig, zo = _sosfilt_scipy_stateful(sos, sig, zi[2, ch])
+                zi[2, ch] = zo
 
             result[:, ch] = sig
 
