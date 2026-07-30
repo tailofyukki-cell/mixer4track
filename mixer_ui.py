@@ -110,6 +110,160 @@ class MicDeviceDialog(QDialog):
 
 
 # ===========================================================================
+# EQカーブ・スペアナ 拡大表示ウィンドウ
+# ===========================================================================
+class ExpandedSpectrumWindow(QWidget):
+    """
+    EQCurveView / GEQCurveView をダブルクリックしたときに開く拡大表示ウィンドウ。
+    メインUIのウィジェットと同じ描画ロジックを使いつつ、600×400px の大きなキャンバスで表示する。
+    リアルタイムでスペクトルデータと EQ カーブを同期する。
+    """
+
+    def __init__(self, title: str, accent_color: str = "#4a90d9",
+                 is_geq: bool = False, parent=None):
+        super().__init__(parent, Qt.Window)
+        self._accent = accent_color
+        self._is_geq = is_geq
+        self._db_range = 18.0
+        self._response: list = []
+        self._spectrum_bands = None
+
+        self.setWindowTitle(title)
+        self.resize(600, 400)
+        self.setMinimumSize(400, 260)
+        self.setStyleSheet("background-color: #0d1117;")
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+
+    # ------------------------------------------------------------------
+    # データ更新（親ウィジェットから呼ばれる）
+    # ------------------------------------------------------------------
+    def update_curve(self, response: list):
+        """周波数特性データ [(freq, gain_db), ...] を受け取って再描画。"""
+        self._response = response
+        self.update()
+
+    def update_spectrum(self, bands):
+        """スペクトルバンドデータを受け取って再描画。"""
+        self._spectrum_bands = bands
+        self.update()
+
+    # ------------------------------------------------------------------
+    # 描画
+    # ------------------------------------------------------------------
+    def paintEvent(self, event):
+        import math as _math
+        from PyQt5.QtGui import QPainterPath
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        mx, my = 16, 16
+        draw_w = w - mx * 2
+        draw_h = h - my * 2
+        center_y = my + draw_h // 2
+        accent = self._accent if not self._is_geq else "#D4A017"
+
+        # 背景
+        painter.fillRect(0, 0, w, h, QColor("#0d1117"))
+
+        # スペクトラムアナライザー バー
+        if self._spectrum_bands is not None and len(self._spectrum_bands) > 0:
+            import numpy as _np
+            bands = self._spectrum_bands
+            num_bands = len(bands)
+            bar_w = max(1, draw_w // num_bands)
+            bar_color = QColor(accent)
+            bar_color.setAlpha(55)
+            painter.setPen(Qt.NoPen)
+            for i, val in enumerate(bands):
+                if val <= 0.01:
+                    continue
+                bx = mx + int(i * draw_w / num_bands)
+                bar_h = int(val * draw_h)
+                by = my + draw_h - bar_h
+                painter.fillRect(bx, by, max(1, bar_w - 1), bar_h, bar_color)
+
+        # グリッド線（±18dB まで 6dB 刻み）
+        for db in [-12, -6, 0, 6, 12]:
+            y = center_y - int(db / self._db_range * (draw_h // 2))
+            if db == 0:
+                pen = QPen(QColor("#3a4050"), 1, Qt.SolidLine)
+            else:
+                pen = QPen(QColor("#2a3040"), 1, Qt.DotLine)
+            painter.setPen(pen)
+            painter.drawLine(mx, y, w - mx, y)
+            # dB ラベル
+            painter.setPen(QPen(QColor("#4a5060"), 1))
+            painter.setFont(QFont("Arial", 8))
+            painter.drawText(2, y - 6, mx - 4, 14, Qt.AlignRight | Qt.AlignVCenter,
+                             f"{db:+d}")
+
+        # 周波数グリッド＆ラベル（拡大版: より多くの周波数を表示）
+        freq_labels = [
+            (50, "50"), (100, "100"), (200, "200"), (500, "500"),
+            (1000, "1k"), (2000, "2k"), (5000, "5k"), (10000, "10k"), (20000, "20k")
+        ]
+        log_min = _math.log10(20)
+        log_max = _math.log10(20000)
+        painter.setFont(QFont("Arial", 8))
+        for fc, lbl in freq_labels:
+            ratio = (_math.log10(fc) - log_min) / (log_max - log_min)
+            x = mx + int(ratio * draw_w)
+            painter.setPen(QPen(QColor("#2a3040"), 1, Qt.DotLine))
+            painter.drawLine(x, my, x, my + draw_h)
+            painter.setPen(QPen(QColor("#5a6070"), 1))
+            painter.drawText(x - 16, my + draw_h + 2, 32, 14,
+                             Qt.AlignCenter, lbl)
+
+        # EQ / GEQ カーブ
+        if not self._response:
+            painter.setPen(QPen(QColor(accent).lighter(60), 1.5, Qt.SolidLine))
+            painter.drawLine(mx, center_y, w - mx, center_y)
+        else:
+            is_flat = all(abs(g) < 0.05 for _, g in self._response)
+            if is_flat:
+                painter.setPen(QPen(QColor(accent).lighter(60), 1.5))
+                painter.drawLine(mx, center_y, w - mx, center_y)
+            else:
+                fill_color = QColor(accent)
+                fill_color.setAlpha(40)
+                path_fill = QPainterPath()
+
+                first_f, first_g = self._response[0]
+                ratio0 = (_math.log10(first_f) - log_min) / (log_max - log_min)
+                x0 = mx + int(ratio0 * draw_w)
+                y0 = center_y - int(first_g / self._db_range * (draw_h // 2))
+                path_fill.moveTo(x0, center_y)
+                path_fill.lineTo(x0, y0)
+
+                points = []
+                for freq, gain_db in self._response:
+                    ratio = (_math.log10(freq) - log_min) / (log_max - log_min)
+                    x = mx + int(ratio * draw_w)
+                    y = center_y - int(gain_db / self._db_range * (draw_h // 2))
+                    y = max(my, min(my + draw_h, y))
+                    path_fill.lineTo(x, y)
+                    points.append((x, y))
+
+                if points:
+                    path_fill.lineTo(points[-1][0], center_y)
+                path_fill.closeSubpath()
+                painter.fillPath(path_fill, QBrush(fill_color))
+
+                curve_color = QColor(accent)
+                curve_color.setAlpha(220)
+                pen = QPen(curve_color, 2.0)
+                pen.setCapStyle(Qt.RoundCap)
+                pen.setJoinStyle(Qt.RoundJoin)
+                painter.setPen(pen)
+                for i in range(len(points) - 1):
+                    painter.drawLine(points[i][0], points[i][1],
+                                     points[i + 1][0], points[i + 1][1])
+
+        painter.end()
+
+
+# ===========================================================================
 # EQカーブ表示ウィジェット
 # ===========================================================================
 class EQCurveView(QWidget):
@@ -122,31 +276,64 @@ class EQCurveView(QWidget):
 
     def __init__(self, accent_color: str = "#4a90d9", parent=None):
         super().__init__(parent)
-        self._response: list = []  # [(freq_hz, gain_db), ...]
+        self._response: list = []
         self._accent = accent_color
-        self._db_range = 18.0      # 表示範囲: 上下各±18dB
+        self._db_range = 18.0
         self.setMinimumHeight(64)
         self.setMaximumHeight(90)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setStyleSheet("background-color: #0d1117; border-radius: 3px;")
-        # スペクトラムアナライザー用バンドデータ（0.0〜1.0）
-        self._spectrum_bands = None  # numpy ndarray or None
+        self._spectrum_bands = None
+        self._expanded_win: Optional['ExpandedSpectrumWindow'] = None  # 拡大ウィンドウ参照
+        self._track_label: str = ""  # ウィンドウタイトル用
+
+    def set_track_label(self, label: str):
+        """拡大ウィンドウのタイトルに使うラベルを設定する。"""
+        self._track_label = label
 
     def update_curve(self, params):
         """EQParamsを受け取って周波数特性カーブを再描画する。"""
         from eq_engine import get_response_db
         self._response = get_response_db(params, n_points=150)
         self.update()
+        if self._expanded_win is not None:
+            self._expanded_win.update_curve(self._response)
 
     def update_spectrum(self, bands):
         """スペクトルバンドデータを更新して再描画する。"""
         self._spectrum_bands = bands
         self.update()
+        if self._expanded_win is not None:
+            self._expanded_win.update_spectrum(bands)
 
     def clear(self):
         """カーブをフラットに戻す。"""
         self._response = []
         self.update()
+        if self._expanded_win is not None:
+            self._expanded_win.update_curve([])
+
+    def mouseDoubleClickEvent(self, event):
+        """ダブルクリックで拡大ウィンドウを開く（または最前面に移動）。"""
+        if self._expanded_win is not None and not self._expanded_win.isHidden():
+            self._expanded_win.raise_()
+            self._expanded_win.activateWindow()
+            return
+        title = f"EQ Spectrum - {self._track_label}" if self._track_label else "EQ Spectrum"
+        win = ExpandedSpectrumWindow(
+            title=title,
+            accent_color=self._accent,
+            is_geq=False
+        )
+        win.update_curve(self._response)
+        win.update_spectrum(self._spectrum_bands)
+        win.destroyed.connect(self._on_expanded_closed)
+        self._expanded_win = win
+        win.show()
+
+    def _on_expanded_closed(self):
+        """拡大ウィンドウが閉じられたときに参照をクリアする。"""
+        self._expanded_win = None
 
     def paintEvent(self, event):
         from eq_engine import EQParams
@@ -272,22 +459,49 @@ class GEQCurveView(QWidget):
         self.setMaximumHeight(90)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setStyleSheet("background-color: #0d1117; border-radius: 3px;")
-        # スペクトラムアナライザー用バンドデータ（0.0〜1.0）
-        self._spectrum_bands = None  # numpy ndarray or None
+        self._spectrum_bands = None
+        self._expanded_win: Optional['ExpandedSpectrumWindow'] = None  # 拡大ウィンドウ参照
 
     def update_spectrum(self, bands):
         """スペクトルバンドデータを更新して再描画する。"""
         self._spectrum_bands = bands
         self.update()
+        if self._expanded_win is not None:
+            self._expanded_win.update_spectrum(bands)
 
     def update_curve(self, params: GEQParams):
         """GEQParamsを受け取ってカーブを再描画する。"""
         self._response = get_geq_response_db(params)
         self.update()
+        if self._expanded_win is not None:
+            self._expanded_win.update_curve(self._response)
 
     def clear(self):
         self._response = []
         self.update()
+        if self._expanded_win is not None:
+            self._expanded_win.update_curve([])
+
+    def mouseDoubleClickEvent(self, event):
+        """ダブルクリックで拡大ウィンドウを開く（または最前面に移動）。"""
+        if self._expanded_win is not None and not self._expanded_win.isHidden():
+            self._expanded_win.raise_()
+            self._expanded_win.activateWindow()
+            return
+        win = ExpandedSpectrumWindow(
+            title="GEQ Spectrum - MASTER",
+            accent_color="#D4A017",
+            is_geq=True
+        )
+        win.update_curve(self._response)
+        win.update_spectrum(self._spectrum_bands)
+        win.destroyed.connect(self._on_expanded_closed)
+        self._expanded_win = win
+        win.show()
+
+    def _on_expanded_closed(self):
+        """拡大ウィンドウが閉じられたときに参照をクリアする。"""
+        self._expanded_win = None
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -1267,6 +1481,7 @@ class TrackWidget(QFrame):
 
         # EQカーブ表示ウィジェット（KEYラベルの下）
         self._eq_curve = EQCurveView(accent_color=self._accent)
+        self._eq_curve.set_track_label(f"Track {self._track.track_id}")
         layout.addWidget(self._eq_curve)
         layout.addStretch()
 
