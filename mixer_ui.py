@@ -1164,6 +1164,441 @@ class LevelMeter(QWidget):
 
 
 # ===========================================================================
+# VUメーターウィジェット（リアルタイムステレオ2ch）
+# ===========================================================================
+class VUMeterWidget(QWidget):
+    """
+    リアルタイムステレオ VU/ピークメーター。
+    - 2ch（L/R）セグメント表示（緑/黄/赤）
+    - dBスケール目盛（-60〜0 dB）
+    - ピークホールドライン（白線）
+    - クリップインジケーター（赤点滅）
+    - ダブルクリックで拡大ウィンドウを開く
+    """
+    # dBスケール: -60dB 〜 0dB
+    DB_MIN = -60.0
+    DB_MAX =   0.0
+    # セグメント数
+    NUM_SEGS = 40
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # RMS値（0.0～1.0）
+        self._rms_l: float = 0.0
+        self._rms_r: float = 0.0
+        # ピークホールド（0.0～1.0）
+        self._peak_l: float = 0.0
+        self._peak_r: float = 0.0
+        # ピークホールドカウンター（50msティック単位）
+        self._peak_hold_l: int = 0
+        self._peak_hold_r: int = 0
+        PEAK_HOLD_TICKS = 60  # 3秒ホールド
+        self._PEAK_HOLD_TICKS = PEAK_HOLD_TICKS
+        # クリップフラグ
+        self._clip_l: bool = False
+        self._clip_r: bool = False
+        # 拡大ウィンドウ参照
+        self._expanded_win = None
+        # クリップ点滅カウンター
+        self._clip_blink: int = 0
+
+        self.setMinimumSize(60, 200)
+        self.setToolTip("ダブルクリックで拡大表示")
+
+    # ------------------------------------------------------------------
+    # データ更新
+    # ------------------------------------------------------------------
+    def update_vu(self, rms_l: float, rms_r: float,
+                  peak_l: float, peak_r: float,
+                  clip_l: bool, clip_r: bool):
+        """VUメーター値を更新して再描画する。"""
+        # RMSはスムージング
+        self._rms_l = rms_l * 0.5 + self._rms_l * 0.5
+        self._rms_r = rms_r * 0.5 + self._rms_r * 0.5
+
+        # ピークホールド処理
+        if peak_l >= self._peak_l:
+            self._peak_l = peak_l
+            self._peak_hold_l = self._PEAK_HOLD_TICKS
+        else:
+            if self._peak_hold_l > 0:
+                self._peak_hold_l -= 1
+            else:
+                self._peak_l = max(0.0, self._peak_l - 0.01)
+
+        if peak_r >= self._peak_r:
+            self._peak_r = peak_r
+            self._peak_hold_r = self._PEAK_HOLD_TICKS
+        else:
+            if self._peak_hold_r > 0:
+                self._peak_hold_r -= 1
+            else:
+                self._peak_r = max(0.0, self._peak_r - 0.01)
+
+        # クリップフラグ（一度セットされたらクリックまで保持）
+        if clip_l:
+            self._clip_l = True
+            self._clip_blink = 0
+        if clip_r:
+            self._clip_r = True
+            self._clip_blink = 0
+        if self._clip_l or self._clip_r:
+            self._clip_blink += 1
+
+        self.update()
+        # 拡大ウィンドウも同期更新
+        if self._expanded_win is not None and not self._expanded_win.isHidden():
+            self._expanded_win.update_vu(
+                self._rms_l, self._rms_r,
+                self._peak_l, self._peak_r,
+                self._clip_l, self._clip_r
+            )
+
+    def reset_clip(self):
+        """クリップフラグをリセットする。"""
+        self._clip_l = False
+        self._clip_r = False
+        self._clip_blink = 0
+        self.update()
+        if self._expanded_win is not None and not self._expanded_win.isHidden():
+            self._expanded_win.reset_clip()
+
+    # ------------------------------------------------------------------
+    # ダブルクリックで拡大ウィンドウを開く
+    # ------------------------------------------------------------------
+    def mouseDoubleClickEvent(self, event):
+        if self._expanded_win is not None and not self._expanded_win.isHidden():
+            self._expanded_win.raise_()
+            self._expanded_win.activateWindow()
+            return
+        win = ExpandedVUMeterWindow(title="VU Meter - MASTER")
+        win.update_vu(
+            self._rms_l, self._rms_r,
+            self._peak_l, self._peak_r,
+            self._clip_l, self._clip_r
+        )
+        win.clip_reset_requested.connect(self.reset_clip)
+        win.destroyed.connect(self._on_expanded_closed)
+        self._expanded_win = win
+        win.show()
+
+    def _on_expanded_closed(self):
+        self._expanded_win = None
+
+    # ------------------------------------------------------------------
+    # 描画（小型インライン表示）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _lin_to_db(lin: float) -> float:
+        """0.0～1.0 の線形振幅を dB に変換。"""
+        if lin <= 0.0:
+            return -120.0
+        return 20.0 * math.log10(lin)
+
+    @staticmethod
+    def _db_to_ratio(db: float, db_min: float, db_max: float) -> float:
+        """dB 値を 0.0～1.0 の表示割合に変換。"""
+        return max(0.0, min(1.0, (db - db_min) / (db_max - db_min)))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        w, h = self.width(), self.height()
+
+        # 背景
+        painter.fillRect(0, 0, w, h, QColor("#0d1117"))
+
+        # 内側マージン
+        mx, my = 2, 4
+        # dB目盛エリア幅（12px）
+        db_label_w = 14
+        # クリップインジケーター高さ
+        clip_h = 8
+        # メーターエリア
+        meter_top = my + clip_h + 2
+        meter_bot = h - my - 16  # 下のdBラベル用スペース
+        meter_h = max(1, meter_bot - meter_top)
+        # L/Rチャンネル幅
+        avail_w = w - mx * 2 - db_label_w
+        ch_gap = 2
+        ch_w = max(4, (avail_w - ch_gap) // 2)
+        lx = mx + db_label_w
+        rx = lx + ch_w + ch_gap
+
+        seg_gap = 1
+        seg_h = max(1, (meter_h - seg_gap * (self.NUM_SEGS - 1)) // self.NUM_SEGS)
+
+        def draw_channel(x: int, rms: float, peak: float, clip: bool):
+            db_rms  = self._lin_to_db(rms)
+            db_peak = self._lin_to_db(peak)
+            rms_ratio  = self._db_to_ratio(db_rms,  self.DB_MIN, self.DB_MAX)
+            peak_ratio = self._db_to_ratio(db_peak, self.DB_MIN, self.DB_MAX)
+            fill_segs = int(rms_ratio * self.NUM_SEGS)
+
+            for seg in range(self.NUM_SEGS):
+                seg_ratio = seg / self.NUM_SEGS
+                sy = meter_bot - (seg + 1) * (seg_h + seg_gap) + seg_gap
+
+                if seg < fill_segs:
+                    if seg_ratio >= 0.875:  # 上位12.5%: 赤
+                        color = QColor("#e74c3c")
+                    elif seg_ratio >= 0.625:  # 中位25%: 黄
+                        color = QColor("#f39c12")
+                    else:  # 下位62.5%: 緑
+                        color = QColor("#27ae60")
+                else:
+                    # 暗色背景セグメント
+                    if seg_ratio >= 0.875:
+                        color = QColor("#3a1010")
+                    elif seg_ratio >= 0.625:
+                        color = QColor("#3a2a00")
+                    else:
+                        color = QColor("#0a2010")
+                painter.fillRect(x, sy, ch_w, seg_h, color)
+
+            # ピークホールドライン
+            if peak > 0.001:
+                py = meter_bot - int(peak_ratio * meter_h)
+                painter.fillRect(x, py, ch_w, 2, QColor("#ffffff"))
+
+        draw_channel(lx, self._rms_l, self._peak_l, self._clip_l)
+        draw_channel(rx, self._rms_r, self._peak_r, self._clip_r)
+
+        # クリップインジケーター（L/R個別）
+        if self._clip_l:
+            blink_on = (self._clip_blink // 5) % 2 == 0
+            c = QColor("#ff2222") if blink_on else QColor("#5a1010")
+            painter.fillRect(lx, my, ch_w, clip_h, c)
+        else:
+            painter.fillRect(lx, my, ch_w, clip_h, QColor("#1a1a1a"))
+
+        if self._clip_r:
+            blink_on = (self._clip_blink // 5) % 2 == 0
+            c = QColor("#ff2222") if blink_on else QColor("#5a1010")
+            painter.fillRect(rx, my, ch_w, clip_h, c)
+        else:
+            painter.fillRect(rx, my, ch_w, clip_h, QColor("#1a1a1a"))
+
+        # dB目盛ラベル（-60, -40, -20, -12, -6, -3, 0）
+        painter.setFont(QFont("Arial", 6))
+        painter.setPen(QPen(QColor("#666666"), 1))
+        for db_mark in [0, -3, -6, -12, -20, -40, -60]:
+            ratio = self._db_to_ratio(db_mark, self.DB_MIN, self.DB_MAX)
+            y = int(meter_bot - ratio * meter_h)
+            label = str(db_mark) if db_mark != 0 else "0"
+            painter.drawText(mx, y - 4, db_label_w - 2, 10,
+                             Qt.AlignRight | Qt.AlignVCenter, label)
+            # グリッド線
+            painter.setPen(QPen(QColor("#2a2a2a"), 1))
+            painter.drawLine(lx, y, rx + ch_w, y)
+            painter.setPen(QPen(QColor("#666666"), 1))
+
+        # チャンネルラベル（L / R）
+        painter.setFont(QFont("Arial", 7))
+        painter.setPen(QPen(QColor("#888888"), 1))
+        painter.drawText(lx, meter_bot + 2, ch_w, 12, Qt.AlignCenter, "L")
+        painter.drawText(rx, meter_bot + 2, ch_w, 12, Qt.AlignCenter, "R")
+
+        painter.end()
+
+
+# ===========================================================================
+# 拡大VUメーターウィンドウ
+# ===========================================================================
+class ExpandedVUMeterWindow(QWidget):
+    """
+    VUMeterWidgetをダブルクリックしたときに開く拡大表示ウィンドウ。
+    400×600px、dB目盛・チャンネルラベル付き。
+    """
+    clip_reset_requested = pyqtSignal()
+
+    DB_MIN = -60.0
+    DB_MAX =   0.0
+    NUM_SEGS = 60
+
+    def __init__(self, title: str = "VU Meter", parent=None):
+        super().__init__(parent, Qt.Window)
+        self.setWindowTitle(title)
+        self.resize(400, 600)
+        self.setMinimumSize(260, 400)
+        self.setStyleSheet("background-color: #0d1117;")
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+
+        self._rms_l: float = 0.0
+        self._rms_r: float = 0.0
+        self._peak_l: float = 0.0
+        self._peak_r: float = 0.0
+        self._clip_l: bool = False
+        self._clip_r: bool = False
+        self._clip_blink: int = 0
+
+        # クリップリセットボタン
+        reset_btn = QPushButton("CLIP RESET", self)
+        reset_btn.setGeometry(10, 10, 90, 22)
+        reset_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3a1010; color: #e74c3c;
+                border: 1px solid #c0392b; border-radius: 3px;
+                font-size: 9px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #c0392b; color: #fff; }
+        """)
+        reset_btn.clicked.connect(self._on_clip_reset)
+
+        # ピンボタン
+        pin_btn = QPushButton("ピン", self)
+        pin_btn.setGeometry(110, 10, 40, 22)
+        pin_btn.setCheckable(True)
+        pin_btn.setStyleSheet("""
+            QPushButton { background-color: #222; color: #aaa;
+                border: 1px solid #444; border-radius: 3px; font-size: 9px; }
+            QPushButton:checked { background-color: #2c3e50; color: #4a90d9;
+                border: 1px solid #4a90d9; }
+        """)
+        pin_btn.toggled.connect(lambda on: self.setWindowFlag(
+            Qt.WindowStaysOnTopHint, on) or self.show())
+
+    def update_vu(self, rms_l, rms_r, peak_l, peak_r, clip_l, clip_r):
+        self._rms_l = rms_l
+        self._rms_r = rms_r
+        self._peak_l = peak_l
+        self._peak_r = peak_r
+        if clip_l:
+            self._clip_l = True
+        if clip_r:
+            self._clip_r = True
+        if self._clip_l or self._clip_r:
+            self._clip_blink += 1
+        self.update()
+
+    def reset_clip(self):
+        self._clip_l = False
+        self._clip_r = False
+        self._clip_blink = 0
+        self.update()
+
+    def _on_clip_reset(self):
+        self.reset_clip()
+        self.clip_reset_requested.emit()
+
+    @staticmethod
+    def _lin_to_db(lin: float) -> float:
+        if lin <= 0.0:
+            return -120.0
+        return 20.0 * math.log10(lin)
+
+    @staticmethod
+    def _db_to_ratio(db: float, db_min: float, db_max: float) -> float:
+        return max(0.0, min(1.0, (db - db_min) / (db_max - db_min)))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        w, h = self.width(), self.height()
+
+        painter.fillRect(0, 0, w, h, QColor("#0d1117"))
+
+        # レイアウト定数
+        mx = 4
+        top_margin = 44  # CLIPインジケーター + タイトル用
+        bot_margin = 24  # L/Rラベル用
+        db_label_w = 28
+        clip_h = 14
+        meter_top = top_margin
+        meter_bot = h - bot_margin
+        meter_h = max(1, meter_bot - meter_top)
+        avail_w = w - mx * 2 - db_label_w
+        ch_gap = 6
+        ch_w = max(8, (avail_w - ch_gap) // 2)
+        lx = mx + db_label_w
+        rx = lx + ch_w + ch_gap
+
+        seg_gap = 2
+        seg_h = max(2, (meter_h - seg_gap * (self.NUM_SEGS - 1)) // self.NUM_SEGS)
+
+        def draw_channel(x: int, rms: float, peak: float, clip: bool):
+            db_rms  = self._lin_to_db(rms)
+            db_peak = self._lin_to_db(peak)
+            rms_ratio  = self._db_to_ratio(db_rms,  self.DB_MIN, self.DB_MAX)
+            peak_ratio = self._db_to_ratio(db_peak, self.DB_MIN, self.DB_MAX)
+            fill_segs = int(rms_ratio * self.NUM_SEGS)
+
+            for seg in range(self.NUM_SEGS):
+                seg_ratio = seg / self.NUM_SEGS
+                sy = meter_bot - (seg + 1) * (seg_h + seg_gap) + seg_gap
+
+                if seg < fill_segs:
+                    if seg_ratio >= 0.875:
+                        color = QColor("#ff3333")
+                    elif seg_ratio >= 0.625:
+                        color = QColor("#ffaa00")
+                    else:
+                        color = QColor("#2ecc71")
+                else:
+                    if seg_ratio >= 0.875:
+                        color = QColor("#3a1010")
+                    elif seg_ratio >= 0.625:
+                        color = QColor("#3a2a00")
+                    else:
+                        color = QColor("#0a2010")
+                painter.fillRect(x, sy, ch_w, seg_h, color)
+
+            # ピークホールドライン（白）
+            if peak > 0.001:
+                py = int(meter_bot - peak_ratio * meter_h)
+                painter.fillRect(x, py, ch_w, 3, QColor("#ffffff"))
+
+        draw_channel(lx, self._rms_l, self._peak_l, self._clip_l)
+        draw_channel(rx, self._rms_r, self._peak_r, self._clip_r)
+
+        # クリップインジケーター
+        for clip_flag, x in [(self._clip_l, lx), (self._clip_r, rx)]:
+            if clip_flag:
+                blink_on = (self._clip_blink // 5) % 2 == 0
+                c = QColor("#ff2222") if blink_on else QColor("#5a1010")
+            else:
+                c = QColor("#1a1a1a")
+            painter.fillRect(x, top_margin - clip_h - 2, ch_w, clip_h, c)
+            painter.setPen(QPen(QColor("#444"), 1))
+            painter.setFont(QFont("Arial", 7, QFont.Bold))
+            if clip_flag:
+                painter.setPen(QPen(QColor("#fff"), 1))
+            painter.drawText(x, top_margin - clip_h - 2, ch_w, clip_h,
+                             Qt.AlignCenter, "CLIP")
+
+        # dB目盛ラベル（詳細）
+        painter.setFont(QFont("Arial", 8))
+        for db_mark in [0, -3, -6, -9, -12, -18, -24, -36, -48, -60]:
+            ratio = self._db_to_ratio(db_mark, self.DB_MIN, self.DB_MAX)
+            y = int(meter_bot - ratio * meter_h)
+            painter.setPen(QPen(QColor("#555555"), 1))
+            painter.drawText(mx, y - 6, db_label_w - 4, 12,
+                             Qt.AlignRight | Qt.AlignVCenter, str(db_mark))
+            painter.setPen(QPen(QColor("#2a2a2a"), 1, Qt.DotLine))
+            painter.drawLine(lx, y, rx + ch_w, y)
+
+        # L / R ラベル
+        painter.setFont(QFont("Arial", 10, QFont.Bold))
+        painter.setPen(QPen(QColor("#aaaaaa"), 1))
+        painter.drawText(lx, meter_bot + 4, ch_w, 18, Qt.AlignCenter, "L")
+        painter.drawText(rx, meter_bot + 4, ch_w, 18, Qt.AlignCenter, "R")
+
+        # 現在値表示（dB）
+        db_l = self._lin_to_db(self._rms_l)
+        db_r = self._lin_to_db(self._rms_r)
+        db_pl = self._lin_to_db(self._peak_l)
+        db_pr = self._lin_to_db(self._peak_r)
+        painter.setFont(QFont("Arial", 8))
+        painter.setPen(QPen(QColor("#888888"), 1))
+        info_y = top_margin - clip_h - 18
+        painter.drawText(lx, info_y, ch_w * 2 + ch_gap, 14, Qt.AlignCenter,
+                         f"L: {db_l:+.1f}dB  R: {db_r:+.1f}dB  "
+                         f"Peak L: {db_pl:+.1f}  R: {db_pr:+.1f}")
+
+        painter.end()
+
+
+# ===========================================================================
 # 縦フェーダーウィジェット
 # ===========================================================================
 class VerticalFader(QWidget):
@@ -1881,8 +2316,52 @@ class MasterTrackWidget(QFrame):
 
         layout.addWidget(fx_frame)
 
-        # フェーダーをトラック側と同じ位置に揃えるため固定スペーサーを挿入
-        layout.addItem(QSpacerItem(0, 395, QSizePolicy.Minimum, QSizePolicy.Fixed))
+        # VUメーターウィジェット（MASTERトラックの空白部分に配置）
+        vu_frame = QFrame()
+        vu_frame.setFrameShape(QFrame.StyledPanel)
+        vu_frame.setStyleSheet("""
+            QFrame {
+                background-color: #0d1117;
+                border: 1px solid #2a2a2a;
+                border-radius: 3px;
+            }
+        """)
+        vu_layout = QVBoxLayout(vu_frame)
+        vu_layout.setContentsMargins(4, 4, 4, 4)
+        vu_layout.setSpacing(2)
+
+        # VUメーターヘッダー
+        vu_header = QHBoxLayout()
+        vu_lbl = QLabel("VU METER")
+        vu_lbl.setStyleSheet(f"color: {Colors.MASTER_ACCENT}; font-size: 8px; font-weight: bold; letter-spacing: 1px;")
+        vu_header.addWidget(vu_lbl)
+        vu_header.addStretch()
+        self._clip_reset_btn = QPushButton("CLIP")
+        self._clip_reset_btn.setFixedSize(36, 16)
+        self._clip_reset_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3a1010; color: #e74c3c;
+                border: 1px solid #c0392b; border-radius: 2px;
+                font-size: 8px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #c0392b; color: #fff; }
+        """)
+        self._clip_reset_btn.setToolTip("クリップ警告をリセット")
+        self._clip_reset_btn.clicked.connect(self._on_clip_reset)
+        vu_header.addWidget(self._clip_reset_btn)
+        vu_layout.addLayout(vu_header)
+
+        self._vu_meter = VUMeterWidget()
+        self._vu_meter.setMinimumHeight(300)
+        vu_layout.addWidget(self._vu_meter)
+
+        # dB値テキスト表示ラベル
+        self._vu_db_label = QLabel("L: --- dB  R: --- dB")
+        self._vu_db_label.setAlignment(Qt.AlignCenter)
+        self._vu_db_label.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: 8px;")
+        vu_layout.addWidget(self._vu_db_label)
+
+        layout.addWidget(vu_frame)
 
         # フェーダー + ステレオ2chメーター
         fader_meter_layout = QHBoxLayout()
@@ -2074,6 +2553,22 @@ class MasterTrackWidget(QFrame):
     def update_level(self, level: float):
         self._meter_l.set_level(level)
         self._meter_r.set_level(level)
+
+    def update_vu_meter(self, rms_l: float, rms_r: float,
+                        peak_l: float, peak_r: float,
+                        clip_l: bool, clip_r: bool):
+        """リアルタイムVUメーター値を更新する。"""
+        self._vu_meter.update_vu(rms_l, rms_r, peak_l, peak_r, clip_l, clip_r)
+        # dB値テキスト更新
+        def to_db(v):
+            return f"{20 * math.log10(max(v, 1e-9)):+.1f}" if v > 0.001 else "-inf"
+        self._vu_db_label.setText(
+            f"L: {to_db(rms_l)} dB  R: {to_db(rms_r)} dB"
+        )
+
+    def _on_clip_reset(self):
+        """クリップ警告をリセットする。"""
+        self._vu_meter.reset_clip()
 
     def show_clip_warning(self, show: bool, ratio: float = 0.0):
         if show:
@@ -2503,6 +2998,20 @@ class MixerMainWindow(QMainWindow):
                 if valid:
                     avg_bands = _np.mean(valid, axis=0)
                     self._master_widget._geq_curve.update_spectrum(avg_bands)
+            except Exception:
+                pass
+
+            # VUメーター更新（リアルレベル取得）
+            try:
+                rms_l, rms_r, peak_l, peak_r, clip_l, clip_r = \
+                    self._engine.get_vu_levels()
+                # 非再生中は減衰
+                if not is_playing:
+                    rms_l = rms_r = 0.0
+                    peak_l = peak_r = 0.0
+                self._master_widget.update_vu_meter(
+                    rms_l, rms_r, peak_l, peak_r, clip_l, clip_r
+                )
             except Exception:
                 pass
 

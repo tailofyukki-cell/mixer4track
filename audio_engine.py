@@ -229,6 +229,15 @@ class AudioEngine:
         self._rec_lock = threading.Lock()
         self._rec_start_time: float = 0.0
 
+        # リアルタイムVU/ピークメーター用（MASTERステレオ）
+        self._vu_rms_l: float = 0.0   # 現在チャンクのRMS（Lch）
+        self._vu_rms_r: float = 0.0   # 現在チャンクのRMS（Rch）
+        self._vu_peak_l: float = 0.0  # ピークホールド値（Lch）
+        self._vu_peak_r: float = 0.0  # ピークホールド値（Rch）
+        self._vu_clip_l: bool = False  # クリップフラグ（Lch）
+        self._vu_clip_r: bool = False  # クリップフラグ（Rch）
+        self._vu_lock = threading.Lock()
+
         self._init_pygame()
 
     # ------------------------------------------------------------------
@@ -597,6 +606,27 @@ class AudioEngine:
             if self._rec_active:
                 self._rec_buffer.append(out.copy())
 
+        # リアルタイムVU/ピークメーター用にミックス済みPCMのレベルを計算
+        try:
+            rms_l = float(np.sqrt(np.mean(out[:, 0] ** 2)))
+            rms_r = float(np.sqrt(np.mean(out[:, 1] ** 2)))
+            peak_l = float(np.max(np.abs(out[:, 0])))
+            peak_r = float(np.max(np.abs(out[:, 1])))
+            with self._vu_lock:
+                self._vu_rms_l = rms_l
+                self._vu_rms_r = rms_r
+                # ピークは新値が大きいときのみ更新（ホールドはメーター側で実施）
+                if peak_l > self._vu_peak_l:
+                    self._vu_peak_l = peak_l
+                if peak_r > self._vu_peak_r:
+                    self._vu_peak_r = peak_r
+                if peak_l >= 0.999:
+                    self._vu_clip_l = True
+                if peak_r >= 0.999:
+                    self._vu_clip_r = True
+        except Exception:
+            pass
+
         i16 = (out * 32767).astype(np.int16)
         return self._pygame.sndarray.make_sound(i16)
 
@@ -643,6 +673,30 @@ class AudioEngine:
 
     def get_master_volume(self) -> float:
         return self._master_volume
+
+    def get_vu_levels(self) -> Tuple[float, float, float, float, bool, bool]:
+        """
+        リアルタイムVU/ピークメーター値を返す。
+        戻り値: (rms_l, rms_r, peak_l, peak_r, clip_l, clip_r)
+        rms/peakは 0.0～1.0 の線形振幅値。
+        """
+        with self._vu_lock:
+            rms_l  = self._vu_rms_l
+            rms_r  = self._vu_rms_r
+            peak_l = self._vu_peak_l
+            peak_r = self._vu_peak_r
+            clip_l = self._vu_clip_l
+            clip_r = self._vu_clip_r
+            # ピーク値は読み取り後に減衰させる（次チャンクまで保持しない）
+            self._vu_peak_l = max(0.0, self._vu_peak_l - 0.005)
+            self._vu_peak_r = max(0.0, self._vu_peak_r - 0.005)
+        return rms_l, rms_r, peak_l, peak_r, clip_l, clip_r
+
+    def reset_vu_clip(self):
+        """VUクリップフラグをリセットする（メータークリック時に呼び出す）。"""
+        with self._vu_lock:
+            self._vu_clip_l = False
+            self._vu_clip_r = False
 
     # ------------------------------------------------------------------
     # マスターGEQ

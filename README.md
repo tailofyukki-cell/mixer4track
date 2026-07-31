@@ -1,6 +1,6 @@
-# Mixer4Track  [Phase 14]
+# Mixer4Track  [Phase 15]
 
-16トラック音楽ミキサーソフト — Phase 14: REC START/STOP方式EXPORT WAV実装版
+16トラック音楽ミキサーソフト — Phase 15: VUメーター/ピークメーター強化版
 
 ## 概要
 
@@ -279,12 +279,31 @@ mixer4track/
 - `audio_engine.py` に `start_rec()` / `stop_rec()` / `get_rec_duration_sec()` / `has_rec_data()` / `export_rec_buffer()` メソッドを追加
 - `_chunk_to_sound()` 内でREC ACTIVE中のミックス済みPCMチャンクをバッファに蓄積
 
+### Phase 15: VUメーター/ピークメーター強化
+- **`VUMeterWidget`** クラスを新規実装（MASTERトラックの空白部分に配置）
+  - 2ch（L/R）セグメント表示（40セグメント、緑/黄/赤）
+  - dBスケール目盛（-60〜0 dB、-60/-40/-20/-12/-6/-3/0 dB表示）
+  - ピークホールドライン（白線、約3秒ホールド）
+  - クリップインジケーター（L/R個別、赤点滅）
+  - 「CLIP」ボタンでクリップ警告を手動リセット
+  - ダブルクリックで拡大ウィンドウを開く
+- **`ExpandedVUMeterWindow`** クラスを新規実装（400×600px、リサイズ可能）
+  - 60セグメントの大型表示
+  - 詳細dB目盛（0/-3/-6/-9/-12/-18/-24/-36/-48/-60 dB）
+  - 現在値dB表示（L/R RMS + Peak）
+  - 「CLIP RESET」ボタン、「ピン」ボタン（常に最前面表示）
+  - リアルタイム同期（50ms間隔）
+- **`audio_engine.py`** に `get_vu_levels()` / `reset_vu_clip()` メソッドを追加
+  - `_chunk_to_sound()` 内でミックス済みPCMチャンクのRMS/ピークをリアルタイム計算
+  - スレッドセーフ（`_vu_lock`）で保護
+  - ピーク値は読み取り後に減衰（メーター側でピークホールドを実施）
+
 ## 将来拡張ロードマップ
 | Phase | 機能 |
 |-------|------|
-| Phase 15 | MIDI コントローラー対応 |
-| Phase 16 | MP3 書き出し（lameenc 統合） |
-| Phase 17 | オートメーション（フェーダー・パンの時間軸変化） |
+| Phase 16 | MIDI コントローラー対応 |
+| Phase 17 | MP3 書き出し（lameenc 統合） |
+| Phase 18 | オートメーション（フェーダー・パンの時間軸変化） |
 
 ---
 *Created by Manus AI — 100日チャレンジ*
