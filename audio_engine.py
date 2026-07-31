@@ -212,6 +212,9 @@ class AudioEngine:
         self._stream_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
+        # EQ/エフェクトパラメータ変更通知イベント
+        # set_eq呼び出し時にストリーミングスレッドを即座に起動し、キュー空白を防ぐ
+        self._param_changed_event = threading.Event()
 
         # MICリアルタイム入力用チャンネル（トラックごと）
         self._mic_channels: Dict[int, Optional[object]] = {}
@@ -219,6 +222,12 @@ class AudioEngine:
 
         # スペクトラムアナライザー用マネージャー
         self._spectrum_manager = SpectrumManager(num_tracks=num_tracks)
+
+        # 録音バッファ（REC START〜REC STOP間のミックス済みPCMを蓄積）
+        self._rec_buffer: List[np.ndarray] = []
+        self._rec_active: bool = False
+        self._rec_lock = threading.Lock()
+        self._rec_start_time: float = 0.0
 
         self._init_pygame()
 
@@ -302,6 +311,8 @@ class AudioEngine:
             s = self._streamers.get(track_id)
         if s is not None:
             s.set_eq(params)
+            # ストリーミングスレッドに即座にキューを補充するよう通知
+            self._param_changed_event.set()
 
     def update_effect(self, track_id: int, preset_name: str, enabled: bool):
         """エフェクトを更新する。再生中は次チャンクから即反映。"""
@@ -457,7 +468,10 @@ class AudioEngine:
                 time.sleep(CHUNK_SEC * QUEUE_AHEAD + 0.1)
                 break
 
-            time.sleep(CHUNK_SEC * 0.05)  # ポーリング間隔（4ms）：キュー空白を最小化
+            # param_changed_eventがセットされたら即座にループを続行（EQ切り替え時にキューを即補充）
+            # イベントがセットされていない場合は最大 CHUNK_SEC*0.05（4ms）待機
+            self._param_changed_event.wait(timeout=CHUNK_SEC * 0.05)
+            self._param_changed_event.clear()
 
         self._playing = False
 
@@ -577,6 +591,11 @@ class AudioEngine:
             self._spectrum_manager.push_chunk(track.track_id, out)
         except Exception:
             pass
+
+        # 録音バッファに蓄積（REC ACTIVE中のみ）
+        with self._rec_lock:
+            if self._rec_active:
+                self._rec_buffer.append(out.copy())
 
         i16 = (out * 32767).astype(np.int16)
         return self._pygame.sndarray.make_sound(i16)
@@ -709,6 +728,97 @@ class AudioEngine:
         if pcm is None:
             return 0.0
         return len(pcm) / SAMPLE_RATE
+
+    # ------------------------------------------------------------------
+    # 録音制御（REC START / REC STOP）
+    # ------------------------------------------------------------------
+
+    def start_rec(self):
+        """録音を開始する。既存バッファをクリアして新規録音を開始。"""
+        with self._rec_lock:
+            self._rec_buffer = []
+            self._rec_active = True
+            self._rec_start_time = time.time()
+
+    def stop_rec(self) -> float:
+        """録音を停止して録音時間（秒）を返す。"""
+        with self._rec_lock:
+            self._rec_active = False
+            if self._rec_buffer:
+                total_samples = sum(len(c) for c in self._rec_buffer)
+                return total_samples / SAMPLE_RATE
+            return 0.0
+
+    def get_rec_duration_sec(self) -> float:
+        """現在の録音バッファの長さ（秒）を返す。録音中はリアルタイムに増加。"""
+        with self._rec_lock:
+            if not self._rec_buffer:
+                return 0.0
+            return sum(len(c) for c in self._rec_buffer) / SAMPLE_RATE
+
+    def has_rec_data(self) -> bool:
+        """録音済みデータが存在するかどうかを返す。"""
+        with self._rec_lock:
+            return len(self._rec_buffer) > 0
+
+    def export_rec_buffer(self, output_path: str) -> ExportResult:
+        """録音バッファをWAVファイルに書き出す。"""
+        with self._rec_lock:
+            if not self._rec_buffer:
+                return ExportResult(
+                    success=False,
+                    error_message="録音データがありません。REC START → REC STOP を実行してから書き出してください。"
+                )
+            # バッファを結合（各チャンクは float32 (CHUNK_SAMPLES, 2)）
+            pcm = np.concatenate(self._rec_buffer, axis=0)  # (total_samples, 2)
+
+        max_val = float(MAX_AMPLITUDE)
+        mix_left  = pcm[:, 0].astype(np.float64) * max_val
+        mix_right = pcm[:, 1].astype(np.float64) * max_val
+        total_len = len(pcm)
+
+        peak_left  = float(np.max(np.abs(mix_left)))
+        peak_right = float(np.max(np.abs(mix_right)))
+        peak_level = max(peak_left, peak_right) / max_val
+
+        clip_left  = int(np.sum(np.abs(mix_left)  > max_val))
+        clip_right = int(np.sum(np.abs(mix_right) > max_val))
+        clipping_count = clip_left + clip_right
+        total_samples  = total_len * 2
+        clipping_ratio = clipping_count / total_samples if total_samples > 0 else 0.0
+        clipping_detected = clipping_count > 0
+
+        if clipping_detected:
+            scale = max_val / max(peak_left, peak_right)
+            mix_left  *= scale
+            mix_right *= scale
+
+        mix_left  = np.clip(mix_left,  -max_val, max_val).astype(np.int16)
+        mix_right = np.clip(mix_right, -max_val, max_val).astype(np.int16)
+
+        interleaved = np.empty(total_len * 2, dtype=np.int16)
+        interleaved[0::2] = mix_left
+        interleaved[1::2] = mix_right
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        try:
+            with wave.open(output_path, 'w') as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(SAMPLE_WIDTH)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(interleaved.tobytes())
+        except Exception as e:
+            return ExportResult(success=False, error_message=f"WAVファイルの書き込みに失敗しました: {e}")
+
+        return ExportResult(
+            success=True,
+            output_path=output_path,
+            duration_sec=total_len / SAMPLE_RATE,
+            clipping_detected=clipping_detected,
+            clipping_count=clipping_count,
+            clipping_ratio=clipping_ratio,
+            peak_level=peak_level,
+        )
 
     # ------------------------------------------------------------------
     # ミックス書き出し

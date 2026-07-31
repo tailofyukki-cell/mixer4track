@@ -1056,18 +1056,17 @@ class Colors:
 # バックグラウンド書き出しスレッド
 # ===========================================================================
 class ExportWorker(QThread):
-    """ミックス書き出しをバックグラウンドで実行するスレッド。"""
+    """録音バッファのWAV書き出しをバックグラウンドで実行するスレッド。"""
 
     finished = pyqtSignal(object)
 
-    def __init__(self, engine: AudioEngine, tracks: List[TrackModel], output_path: str):
+    def __init__(self, engine: AudioEngine, output_path: str):
         super().__init__()
         self._engine = engine
-        self._tracks = tracks
         self._output_path = output_path
 
     def run(self):
-        result = self._engine.export_mix(self._tracks, self._output_path)
+        result = self._engine.export_rec_buffer(self._output_path)
         self.finished.emit(result)
 
 
@@ -1676,6 +1675,9 @@ class MasterTrackWidget(QFrame):
     effectChanged = pyqtSignal(int, str, bool)
     # GEQモード変更通知: 'low' / 'hi' / 'off'
     geqModeChanged = pyqtSignal(str)
+    # REC START / STOP ボタンシグナル
+    rec_start_clicked = pyqtSignal()
+    rec_stop_clicked = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1712,9 +1714,10 @@ class MasterTrackWidget(QFrame):
         self._clip_label.setStyleSheet(f"color: {Colors.CLIP_WARNING}; font-size: 9px; font-weight: bold; padding: 2px;")
         layout.addWidget(self._clip_label)
 
-        # EXPORT WAV ボタン
+        # EXPORT WAV ボタン（初期状態は無効）
         self._export_btn = QPushButton("EXPORT WAV")
-        self._export_btn.setFixedHeight(24)
+        self._export_btn.setFixedHeight(28)
+        self._export_btn.setEnabled(False)
         self._export_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {Colors.BTN_EXPORT}; color: {Colors.TEXT_PRIMARY};
@@ -1723,9 +1726,42 @@ class MasterTrackWidget(QFrame):
             }}
             QPushButton:hover {{ background-color: {Colors.BTN_EXPORT_HOV}; }}
             QPushButton:pressed {{ background-color: #4a235a; }}
-            QPushButton:disabled {{ background-color: #333; color: #666; }}
+            QPushButton:disabled {{ background-color: #333; color: #666; border: 1px solid #555; }}
         """)
         layout.addWidget(self._export_btn)
+
+        # REC START ボタン（初期有効）
+        self._rec_start_btn = QPushButton("REC START")
+        self._rec_start_btn.setFixedHeight(28)
+        self._rec_start_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1a5c2a; color: #e8e8e8;
+                border: 1px solid #27ae60; border-radius: 3px;
+                font-size: 9px; font-weight: bold; letter-spacing: 1px;
+            }
+            QPushButton:hover { background-color: #27ae60; color: #fff; }
+            QPushButton:pressed { background-color: #145a20; }
+            QPushButton:disabled { background-color: #333; color: #666; border: 1px solid #555; }
+        """)
+        self._rec_start_btn.clicked.connect(self.rec_start_clicked)
+        layout.addWidget(self._rec_start_btn)
+
+        # REC STOP ボタン（初期無効）
+        self._rec_stop_btn = QPushButton("REC STOP")
+        self._rec_stop_btn.setFixedHeight(28)
+        self._rec_stop_btn.setEnabled(False)
+        self._rec_stop_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #5c1a1a; color: #e8e8e8;
+                border: 1px solid #c0392b; border-radius: 3px;
+                font-size: 9px; font-weight: bold; letter-spacing: 1px;
+            }
+            QPushButton:hover { background-color: #c0392b; color: #fff; }
+            QPushButton:pressed { background-color: #4a0f0f; }
+            QPushButton:disabled { background-color: #333; color: #666; border: 1px solid #555; }
+        """)
+        self._rec_stop_btn.clicked.connect(self.rec_stop_clicked)
+        layout.addWidget(self._rec_stop_btn)
 
         # =============================================
         # Phase 9: GEQパネル（GEQ Low / GEQ Hi）
@@ -2159,6 +2195,8 @@ class MixerMainWindow(QMainWindow):
         self._master_widget._export_btn.clicked.connect(self._on_export)
         self._master_widget.effectChanged.connect(self._on_master_effect_changed)
         self._master_widget.geqModeChanged.connect(self._on_geq_mode_changed)
+        self._master_widget.rec_start_clicked.connect(self._on_rec_start)
+        self._master_widget.rec_stop_clicked.connect(self._on_rec_stop)
 
         container_layout.addWidget(self._bank_a_widget)
         container_layout.addWidget(self._bank_b_widget)
@@ -2419,6 +2457,9 @@ class MixerMainWindow(QMainWindow):
         self._timer.start()
         self._pseudo_levels = [0.0] * self.NUM_TRACKS
         self._master_pseudo_level = 0.0
+        self._rec_blink_state = False   # REC STOPボタンの点滅用
+        self._rec_blink_counter = 0     # 50msティックカウンター
+        self._rec_duration_sec: float = 0.0  # 録音完了時の時間保持
 
     def _update_meters(self):
         any_solo = any(t.solo for t in self._tracks)
@@ -2469,6 +2510,28 @@ class MixerMainWindow(QMainWindow):
             self._playing_indicator.setStyleSheet(f"color: {Colors.METER_LOW}; font-size: 16px;")
         else:
             self._playing_indicator.setStyleSheet(f"color: #333; font-size: 16px;")
+
+        # REC STOPボタンのリアルタイム更新（録音中のみ）
+        if self._master_widget and self._engine._rec_active:
+            self._rec_blink_counter += 1
+            dur = self._engine.get_rec_duration_sec()
+            m = int(dur // 60)
+            s = dur % 60
+            # 10ティック（500ms）ごとに点滅（ドット表示切り替え）
+            if self._rec_blink_counter % 10 < 5:
+                dot = "\u25cf"
+            else:
+                dot = "\u25cb"
+            self._master_widget._rec_stop_btn.setText(f"REC {dot} {m}:{s:04.1f}")
+            self._master_widget._rec_stop_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #c0392b; color: #fff;
+                    border: 2px solid #ff6b6b; border-radius: 3px;
+                    font-size: 9px; font-weight: bold; letter-spacing: 1px;
+                }
+                QPushButton:hover { background-color: #e74c3c; }
+                QPushButton:pressed { background-color: #4a0f0f; }
+            """)
 
     # ------------------------------------------------------------------
     # スロット（トラック操作）
@@ -2680,19 +2743,74 @@ class MixerMainWindow(QMainWindow):
         self._engine.update_master_geq(self._geq_params)
 
     # ------------------------------------------------------------------
-    # Phase 2: ミックス書き出し
+    # Phase 14: REC START / REC STOP / EXPORT WAV
     # ------------------------------------------------------------------
 
+    @pyqtSlot()
+    def _on_rec_start(self):
+        """録音開始スロット。"""
+        self._engine.start_rec()
+        self._rec_blink_counter = 0
+        self._rec_blink_state = False
+        if self._master_widget:
+            # ボタン状態: EXPORT無効 / REC START無効 / REC STOP有効
+            self._master_widget._export_btn.setEnabled(False)
+            self._master_widget._export_btn.setText("EXPORT WAV")
+            self._master_widget._rec_start_btn.setEnabled(False)
+            self._master_widget._rec_stop_btn.setEnabled(True)
+            self._master_widget._rec_stop_btn.setText("REC \u25cf 0:00.0")
+        self._set_status("REC: 録音中... REC STOPを押すと録音を停止します")
+
+    @pyqtSlot()
+    def _on_rec_stop(self):
+        """録音停止スロット。"""
+        dur = self._engine.stop_rec()
+        self._rec_duration_sec = dur
+        m = int(dur // 60)
+        s = dur % 60
+        dur_str = f"{m}:{s:04.1f}"
+        if self._master_widget:
+            # ボタン状態: EXPORT有効(時間表示) / REC START有効 / REC STOP無効
+            self._master_widget._export_btn.setEnabled(True)
+            self._master_widget._export_btn.setText(f"EXPORT WAV ({dur_str})")
+            self._master_widget._export_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {Colors.BTN_EXPORT}; color: {Colors.TEXT_PRIMARY};
+                    border: 2px solid #e056ef; border-radius: 3px;
+                    font-size: 9px; font-weight: bold; letter-spacing: 1px;
+                }}
+                QPushButton:hover {{ background-color: {Colors.BTN_EXPORT_HOV}; }}
+                QPushButton:pressed {{ background-color: #4a235a; }}
+                QPushButton:disabled {{ background-color: #333; color: #666; border: 1px solid #555; }}
+            """)
+            self._master_widget._rec_start_btn.setEnabled(True)
+            self._master_widget._rec_stop_btn.setEnabled(False)
+            self._master_widget._rec_stop_btn.setText("REC STOP")
+            self._master_widget._rec_stop_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #5c1a1a; color: #e8e8e8;
+                    border: 1px solid #c0392b; border-radius: 3px;
+                    font-size: 9px; font-weight: bold; letter-spacing: 1px;
+                }
+                QPushButton:hover { background-color: #c0392b; color: #fff; }
+                QPushButton:pressed { background-color: #4a0f0f; }
+                QPushButton:disabled { background-color: #333; color: #666; border: 1px solid #555; }
+            """)
+        self._set_status(f"REC: 録音完了 ({dur_str}) | EXPORT WAVで書き出せます")
+
     def _on_export(self):
-        loaded = [t for t in self._tracks if t.file_path is not None]
-        if not loaded:
+        """録音バッファをWAVに書き出す。"""
+        if not self._engine.has_rec_data():
             QMessageBox.information(self, "Cannot Export",
-                "Please load at least one audio file before exporting.")
+                "録音データがありません。\nREC START → REC STOP を実行してから書き出してください。")
             return
 
-        default_name = "mix_export.wav"
+        m = int(self._rec_duration_sec // 60)
+        s = self._rec_duration_sec % 60
+        dur_str = f"{m}:{s:04.1f}"
+        default_name = f"rec_{dur_str.replace(':', '-')}.wav"
         output_path, _ = QFileDialog.getSaveFileName(
-            self, "Export Mix as WAV",
+            self, "Export Recording as WAV",
             os.path.join(os.path.expanduser("~"), "Desktop", default_name),
             "WAV Files (*.wav)"
         )
@@ -2704,17 +2822,25 @@ class MixerMainWindow(QMainWindow):
         if self._master_widget:
             self._master_widget._export_btn.setEnabled(False)
             self._master_widget._export_btn.setText("Exporting...")
-        self._set_status("Exporting mix...")
+            self._master_widget._rec_start_btn.setEnabled(False)
+            self._master_widget._rec_stop_btn.setEnabled(False)
+        self._set_status("Exporting recording...")
 
-        self._export_worker = ExportWorker(self._engine, self._tracks, output_path)
+        self._export_worker = ExportWorker(self._engine, output_path)
         self._export_worker.finished.connect(self._on_export_finished)
         self._export_worker.start()
 
     @pyqtSlot(object)
     def _on_export_finished(self, result: ExportResult):
         if self._master_widget:
+            # 書き出完了後: EXPORT有効(時間表示) / REC START有効 / REC STOP無効
+            m = int(self._rec_duration_sec // 60)
+            s = self._rec_duration_sec % 60
+            dur_str = f"{m}:{s:04.1f}"
             self._master_widget._export_btn.setEnabled(True)
-            self._master_widget._export_btn.setText("EXPORT WAV")
+            self._master_widget._export_btn.setText(f"EXPORT WAV ({dur_str})")
+            self._master_widget._rec_start_btn.setEnabled(True)
+            self._master_widget._rec_stop_btn.setEnabled(False)
 
         if not result.success:
             QMessageBox.critical(self, "Export Failed", result.error_message)
