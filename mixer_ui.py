@@ -1599,6 +1599,354 @@ class ExpandedVUMeterWindow(QWidget):
 
 
 # ===========================================================================
+# アナログ针式VUメーターウィジェット
+# ===========================================================================
+class AnalogVUMeterWidget(QWidget):
+    """
+    アナログ针式VUメーター。
+    小型インライン表示用（2ch L/R并列）。
+    ダブルクリックで拡大ウィンドウを開く。
+    """
+    # VUメーターのdBスケール（実障のVU視覆角に対応）
+    # -20 VU 〜 +3 VU、角度範囲: -60度 〜 +60度
+    DB_MIN = -20.0
+    DB_MAX =  3.0
+    ANGLE_MIN = -65.0   # -20VU 側の角度（度）
+    ANGLE_MAX =  65.0   # +3VU 側の角度（度）
+    # ピークホールドティック数（50ms単位）
+    PEAK_HOLD_TICKS = 40
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rms_l: float = 0.0
+        self._rms_r: float = 0.0
+        self._needle_l: float = self.ANGLE_MIN  # 現在の针角度（Lch）
+        self._needle_r: float = self.ANGLE_MIN  # 現在の针角度（Rch）
+        self._peak_l: float = 0.0
+        self._peak_r: float = 0.0
+        self._peak_hold_l: int = 0
+        self._peak_hold_r: int = 0
+        self._clip_l: bool = False
+        self._clip_r: bool = False
+        self._clip_blink: int = 0
+        self._expanded_win = None
+        self.setMinimumSize(120, 80)
+        self.setToolTip("ダブルクリックで拡大表示")
+
+    @staticmethod
+    def _lin_to_db(lin: float) -> float:
+        if lin <= 0.0:
+            return -120.0
+        return 20.0 * math.log10(lin)
+
+    @staticmethod
+    def _db_to_angle(db: float, db_min: float, db_max: float,
+                     angle_min: float, angle_max: float) -> float:
+        ratio = max(0.0, min(1.0, (db - db_min) / (db_max - db_min)))
+        return angle_min + ratio * (angle_max - angle_min)
+
+    def update_vu(self, rms_l: float, rms_r: float,
+                  peak_l: float, peak_r: float,
+                  clip_l: bool, clip_r: bool):
+        """VU値を更新し针をアニメーションする。"""
+        self._rms_l = rms_l
+        self._rms_r = rms_r
+
+        # 针角度はスムージング（慣性の遅いVU针の展漫を表現）
+        db_l = self._lin_to_db(rms_l)
+        db_r = self._lin_to_db(rms_r)
+        target_l = self._db_to_angle(db_l, self.DB_MIN, self.DB_MAX,
+                                     self.ANGLE_MIN, self.ANGLE_MAX)
+        target_r = self._db_to_angle(db_r, self.DB_MIN, self.DB_MAX,
+                                     self.ANGLE_MIN, self.ANGLE_MAX)
+        # VU针の慣性: 上昇は速く、下降は遅い
+        if target_l > self._needle_l:
+            self._needle_l += (target_l - self._needle_l) * 0.35
+        else:
+            self._needle_l += (target_l - self._needle_l) * 0.12
+        if target_r > self._needle_r:
+            self._needle_r += (target_r - self._needle_r) * 0.35
+        else:
+            self._needle_r += (target_r - self._needle_r) * 0.12
+
+        # ピークホールド
+        if peak_l >= self._peak_l:
+            self._peak_l = peak_l
+            self._peak_hold_l = self.PEAK_HOLD_TICKS
+        else:
+            if self._peak_hold_l > 0:
+                self._peak_hold_l -= 1
+            else:
+                self._peak_l = max(0.0, self._peak_l - 0.015)
+
+        if peak_r >= self._peak_r:
+            self._peak_r = peak_r
+            self._peak_hold_r = self.PEAK_HOLD_TICKS
+        else:
+            if self._peak_hold_r > 0:
+                self._peak_hold_r -= 1
+            else:
+                self._peak_r = max(0.0, self._peak_r - 0.015)
+
+        if clip_l:
+            self._clip_l = True
+            self._clip_blink = 0
+        if clip_r:
+            self._clip_r = True
+            self._clip_blink = 0
+        if self._clip_l or self._clip_r:
+            self._clip_blink += 1
+
+        self.update()
+        if self._expanded_win is not None and not self._expanded_win.isHidden():
+            self._expanded_win.update_vu(
+                rms_l, rms_r, peak_l, peak_r, clip_l, clip_r
+            )
+
+    def reset_clip(self):
+        self._clip_l = False
+        self._clip_r = False
+        self._clip_blink = 0
+        self.update()
+        if self._expanded_win is not None and not self._expanded_win.isHidden():
+            self._expanded_win.reset_clip()
+
+    def mouseDoubleClickEvent(self, event):
+        if self._expanded_win is not None and not self._expanded_win.isHidden():
+            self._expanded_win.raise_()
+            self._expanded_win.activateWindow()
+            return
+        win = ExpandedAnalogVUWindow(title="VU Meter - MASTER (Analog)")
+        win.update_vu(self._rms_l, self._rms_r,
+                      self._peak_l, self._peak_r,
+                      self._clip_l, self._clip_r)
+        win.destroyed.connect(self._on_expanded_closed)
+        self._expanded_win = win
+        win.show()
+
+    def _on_expanded_closed(self):
+        self._expanded_win = None
+
+    def _draw_vu_face(self, painter, cx, cy, radius, needle_angle,
+                      peak_angle, clip_flag, label, compact=True):
+        """アナログVUメーターの顔を描画する共通メソッド。"""
+        import math as _math
+
+        # 文字盤背景（クリーム色）
+        face_color = QColor("#f0e8c8")
+        painter.setBrush(QBrush(face_color))
+        painter.setPen(QPen(QColor("#333333"), 1.5))
+        painter.drawEllipse(int(cx - radius), int(cy - radius),
+                            int(radius * 2), int(radius * 2))
+
+        # 目盛の定義
+        # VUメーターの目盛: -20, -10, -7, -5, -3, 0, +3 (VU)
+        marks = [
+            (-20.0, "-20", False), (-10.0, "10", False), (-7.0, "7", False),
+            (-5.0, "5", False),   (-3.0, "3", False),
+            (0.0,  "0",  True),   (3.0,  "+3", True),
+        ]
+        tick_lengths_major = [
+            (-20.0, True), (-10.0, True), (-7.0, False), (-5.0, True),
+            (-3.0, True), (0.0, True), (3.0, True)
+        ]
+        # 小刻目位置
+        minor_marks_db = [-15.0, -12.0, -9.0, -6.0, -4.0, -2.0, -1.0, 1.0, 2.0]
+
+        font_size = max(5, int(radius * (0.13 if compact else 0.16)))
+        painter.setFont(QFont("Arial", font_size, QFont.Bold))
+
+        for db_val, label_str, is_red in marks:
+            angle_deg = self._db_to_angle(db_val, self.DB_MIN, self.DB_MAX,
+                                          self.ANGLE_MIN, self.ANGLE_MAX)
+            # 角度は下から時計回り方向、中心から上向きが0度
+            rad = _math.radians(angle_deg - 90)
+            tick_outer = radius * 0.92
+            tick_inner = radius * 0.75
+            x1 = cx + tick_outer * _math.cos(rad)
+            y1 = cy + tick_outer * _math.sin(rad)
+            x2 = cx + tick_inner * _math.cos(rad)
+            y2 = cy + tick_inner * _math.sin(rad)
+            color = QColor("#cc0000") if is_red else QColor("#222222")
+            painter.setPen(QPen(color, 1.5 if compact else 2.0))
+            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+            # ラベル位置
+            label_r = radius * 0.60
+            lx = cx + label_r * _math.cos(rad)
+            ly = cy + label_r * _math.sin(rad)
+            lw = int(radius * 0.35)
+            lh = int(radius * 0.22)
+            painter.setPen(QPen(color, 1))
+            painter.drawText(int(lx - lw / 2), int(ly - lh / 2), lw, lh,
+                             Qt.AlignCenter, label_str)
+
+        # 小刻目
+        painter.setPen(QPen(QColor("#555555"), 1.0))
+        for db_val in minor_marks_db:
+            angle_deg = self._db_to_angle(db_val, self.DB_MIN, self.DB_MAX,
+                                          self.ANGLE_MIN, self.ANGLE_MAX)
+            rad = _math.radians(angle_deg - 90)
+            tick_outer = radius * 0.92
+            tick_inner = radius * 0.83
+            x1 = cx + tick_outer * _math.cos(rad)
+            y1 = cy + tick_outer * _math.sin(rad)
+            x2 = cx + tick_inner * _math.cos(rad)
+            y2 = cy + tick_inner * _math.sin(rad)
+            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+        # 赤帯域（0dB〜+3dB）
+        red_start_db = 0.0
+        red_end_db = 3.0
+        a_start = self._db_to_angle(red_start_db, self.DB_MIN, self.DB_MAX,
+                                    self.ANGLE_MIN, self.ANGLE_MAX)
+        a_end = self._db_to_angle(red_end_db, self.DB_MIN, self.DB_MAX,
+                                  self.ANGLE_MIN, self.ANGLE_MAX)
+        arc_r = radius * 0.88
+        arc_rect = QRectF(cx - arc_r, cy - arc_r, arc_r * 2, arc_r * 2)
+        # QtのdrawArcは16分の1度単位、開始角度は3時から反時計回り
+        qt_start = int((90 - a_end) * 16)
+        qt_span  = int((a_end - a_start) * 16)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor("#cc0000")))
+        arc_thick = max(3, int(radius * 0.10))
+        for r_off in range(arc_thick):
+            r_cur = arc_r - r_off
+            if r_cur <= 0:
+                break
+            arc_rect_cur = QRectF(cx - r_cur, cy - r_cur, r_cur * 2, r_cur * 2)
+            painter.setPen(QPen(QColor("#cc0000"), 1))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawArc(arc_rect_cur, qt_start, qt_span)
+
+        # ピークホールドマーカー（青線）
+        if peak_angle > self.ANGLE_MIN:
+            peak_rad = _math.radians(peak_angle - 90)
+            pk_outer = radius * 0.93
+            pk_inner = radius * 0.70
+            pkx1 = cx + pk_outer * _math.cos(peak_rad)
+            pky1 = cy + pk_outer * _math.sin(peak_rad)
+            pkx2 = cx + pk_inner * _math.cos(peak_rad)
+            pky2 = cy + pk_inner * _math.sin(peak_rad)
+            painter.setPen(QPen(QColor("#0066cc"), 2))
+            painter.drawLine(int(pkx1), int(pky1), int(pkx2), int(pky2))
+
+        # 针
+        needle_rad = _math.radians(needle_angle - 90)
+        needle_len = radius * 0.85
+        nx = cx + needle_len * _math.cos(needle_rad)
+        ny = cy + needle_len * _math.sin(needle_rad)
+        painter.setPen(QPen(QColor("#111111"), max(1, int(radius * 0.04))))
+        painter.drawLine(int(cx), int(cy), int(nx), int(ny))
+        # 针の中心点
+        pivot_r = max(3, int(radius * 0.07))
+        painter.setBrush(QBrush(QColor("#333333")))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(int(cx - pivot_r), int(cy - pivot_r),
+                            pivot_r * 2, pivot_r * 2)
+
+        # PEAK LED（右上）
+        led_x = int(cx + radius * 0.62)
+        led_y = int(cy - radius * 0.30)
+        led_r = max(4, int(radius * 0.10))
+        blink_on = (self._clip_blink // 5) % 2 == 0
+        led_color = QColor("#ff2222") if (clip_flag and blink_on) else \
+                    (QColor("#880000") if clip_flag else QColor("#3a1010"))
+        painter.setBrush(QBrush(led_color))
+        painter.setPen(QPen(QColor("#222222"), 1))
+        painter.drawEllipse(led_x - led_r, led_y - led_r, led_r * 2, led_r * 2)
+        # PEAKラベル
+        painter.setFont(QFont("Arial", max(4, int(radius * 0.09))))
+        painter.setPen(QPen(QColor("#555555"), 1))
+        painter.drawText(led_x - led_r * 2, led_y + led_r + 1,
+                         led_r * 4, 10, Qt.AlignCenter, "PEAK")
+
+        # チャンネルラベル（VU文字の代わりに）
+        painter.setFont(QFont("Arial", max(6, int(radius * 0.14)), QFont.Bold))
+        painter.setPen(QPen(QColor("#333333"), 1))
+        painter.drawText(int(cx - radius * 0.2), int(cy + radius * 0.05),
+                         int(radius * 0.4), int(radius * 0.25),
+                         Qt.AlignCenter, label)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # 背景
+        painter.fillRect(0, 0, w, h, QColor("#1a1a1a"))
+
+        # 2つのVU表示（L/R带平列）
+        margin = 4
+        half_w = (w - margin * 3) // 2
+        radius_l = min(half_w, h - margin * 2) * 0.48
+        radius_r = radius_l
+        cx_l = margin + half_w // 2
+        cx_r = margin * 2 + half_w + half_w // 2
+        cy = int(h * 0.55)
+
+        # Lチャンネル
+        peak_angle_l = self._db_to_angle(
+            self._lin_to_db(self._peak_l), self.DB_MIN, self.DB_MAX,
+            self.ANGLE_MIN, self.ANGLE_MAX
+        )
+        self._draw_vu_face(painter, cx_l, cy, radius_l,
+                           self._needle_l, peak_angle_l, self._clip_l, "L")
+
+        # Rチャンネル
+        peak_angle_r = self._db_to_angle(
+            self._lin_to_db(self._peak_r), self.DB_MIN, self.DB_MAX,
+            self.ANGLE_MIN, self.ANGLE_MAX
+        )
+        self._draw_vu_face(painter, cx_r, cy, radius_r,
+                           self._needle_r, peak_angle_r, self._clip_r, "R")
+
+        painter.end()
+
+
+# ===========================================================================
+# 拡大アナログVUメーターウィンドウ
+# ===========================================================================
+class ExpandedAnalogVUWindow(QWidget):
+    """
+    AnalogVUMeterWidgetをダブルクリックしたときに開く拡大表示ウィンドウ。
+    大型アナログVUメーターをリアルタイム表示。
+    """
+    def __init__(self, title: str = "VU Meter", parent=None):
+        super().__init__(parent, Qt.Window)
+        self.setWindowTitle(title)
+        self.resize(600, 320)
+        self.setMinimumSize(400, 220)
+        self.setStyleSheet("background-color: #1a1a1a;")
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+
+        self._meter = AnalogVUMeterWidget(self)
+        self._meter.setGeometry(0, 40, 600, 260)
+
+        # ピンボタン
+        pin_btn = QPushButton("ピン", self)
+        pin_btn.setGeometry(10, 8, 44, 22)
+        pin_btn.setCheckable(True)
+        pin_btn.setStyleSheet("""
+            QPushButton { background-color: #222; color: #aaa;
+                border: 1px solid #444; border-radius: 3px; font-size: 9px; }
+            QPushButton:checked { background-color: #2c3e50; color: #4a90d9;
+                border: 1px solid #4a90d9; }
+        """)
+        pin_btn.toggled.connect(lambda on: self.setWindowFlag(
+            Qt.WindowStaysOnTopHint, on) or self.show())
+
+    def update_vu(self, rms_l, rms_r, peak_l, peak_r, clip_l, clip_r):
+        self._meter.update_vu(rms_l, rms_r, peak_l, peak_r, clip_l, clip_r)
+
+    def reset_clip(self):
+        self._meter.reset_clip()
+
+    def resizeEvent(self, event):
+        self._meter.setGeometry(0, 40, self.width(), self.height() - 40)
+
+
+# ===========================================================================
 # 縦フェーダーウィジェット
 # ===========================================================================
 class VerticalFader(QWidget):
@@ -2351,8 +2699,16 @@ class MasterTrackWidget(QFrame):
         vu_header.addWidget(self._clip_reset_btn)
         vu_layout.addLayout(vu_header)
 
+        # アナログ针式VUメーター
+        self._analog_vu_meter = AnalogVUMeterWidget()
+        self._analog_vu_meter.setMinimumHeight(110)
+        self._analog_vu_meter.setMaximumHeight(130)
+        vu_layout.addWidget(self._analog_vu_meter)
+
+        # セグメントVUメーター（高さを小さく調整）
         self._vu_meter = VUMeterWidget()
-        self._vu_meter.setMinimumHeight(300)
+        self._vu_meter.setMinimumHeight(180)
+        self._vu_meter.setMaximumHeight(220)
         vu_layout.addWidget(self._vu_meter)
 
         # dB値テキスト表示ラベル
@@ -2559,6 +2915,7 @@ class MasterTrackWidget(QFrame):
                         clip_l: bool, clip_r: bool):
         """リアルタイムVUメーター値を更新する。"""
         self._vu_meter.update_vu(rms_l, rms_r, peak_l, peak_r, clip_l, clip_r)
+        self._analog_vu_meter.update_vu(rms_l, rms_r, peak_l, peak_r, clip_l, clip_r)
         # dB値テキスト更新
         def to_db(v):
             return f"{20 * math.log10(max(v, 1e-9)):+.1f}" if v > 0.001 else "-inf"
@@ -2569,6 +2926,7 @@ class MasterTrackWidget(QFrame):
     def _on_clip_reset(self):
         """クリップ警告をリセットする。"""
         self._vu_meter.reset_clip()
+        self._analog_vu_meter.reset_clip()
 
     def show_clip_warning(self, show: bool, ratio: float = 0.0):
         if show:
