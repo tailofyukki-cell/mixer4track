@@ -1,6 +1,6 @@
-# Mixer4Track  [Phase 16]
+# Mixer4Track  [Phase 17]
 
-16トラック音楽ミキサーソフト — Phase 16: アナログ针式VUメーター追加版
+16トラック音楽ミキサーソフト — Phase 17: PAUSEボタン（一時停止）追加版
 
 ## 概要
 
@@ -282,6 +282,18 @@ mixer4track/
 ### Phase 15: VUメーター/ピークメーター強化
 
 ### Phase 16: アナログ针式VUメーター追加
+
+### Phase 17: PAUSEボタン（一時停止）追加
+- **`audio_engine.py`** に `pause()` / `resume()` / `is_paused()` メソッドを追加
+  - `pygame.mixer.pause()` / `unpause()` で全チャンネルを一時停止・再開
+  - `_stream_loop` 内でポーズ中はチャンク供給を停止して待機
+  - `stop_all()` 時に `_paused` フラグをリセット
+- **`mixer_ui.py`** に PAUSEボタンを追加（PLAYボSTOPの間に配置）
+  - 初期状態: 無効（グレー）
+  - 再生中: 「⏸ PAUSE」（黄色）で有効化
+  - ポーズ中: 「▶ RESUME」（青色）に変化
+  - STOP時・再生終了時: 無効に戻る
+  - PLAYボタンは再生中無効化（誤操作防止）
 - **`AnalogVUMeterWidget`** クラスを新規実装（MASTERトラックのセグメントVUメーターの上に配置）
   - 実障のVUメーターと同じ目盛配置（-20/10/7/5/3/0/+3 VU）
   - 针の慣性アニメーション（上昇は速く、下降は遅い）
@@ -313,9 +325,9 @@ mixer4track/
 ## 将来拡張ロードマップ
 | Phase | 機能 |
 |-------|------|
-| Phase 17 | MIDI コントローラー対応 |
-| Phase 18 | MP3 書き出し（lameenc 統合） |
-| Phase 19 | オートメーション（フェーダー・パンの時間軸変化） |
+| Phase 18 | MIDI コントローラー対応 |
+| Phase 19 | MP3 書き出し（lameenc 統合） |
+| Phase 20 | オートメーション（フェーダー・パンの時間軸変化） |
 
 ---
 *Created by Manus AI — 100日チャレンジ*

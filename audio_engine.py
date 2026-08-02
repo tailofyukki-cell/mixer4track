@@ -200,6 +200,7 @@ class AudioEngine:
 
         # 再生状態
         self._playing = False
+        self._paused = False   # 一時停止中フラグ
         self._tracks_snapshot: List[TrackModel] = []
         self._master_volume: float = 1.0
 
@@ -386,9 +387,37 @@ class AudioEngine:
             self._channels = {k: None for k in self._channels}
             self._streamers = {}
         self._playing = False
+        self._paused = False
+
+    def pause(self):
+        """再生を一時停止する。再生中のみ有効。"""
+        if not self._initialized or not self._playing or self._paused:
+            return
+        try:
+            self._pygame.mixer.pause()  # 全チャンネルを一時停止
+            self._paused = True
+            # ストリームループにポーズを通知（チャンク供給を一時停止）
+            self._param_changed_event.set()
+        except Exception as e:
+            print(f"[AudioEngine] pause失敗: {e}")
+
+    def resume(self):
+        """一時停止から再開する。ポーズ中のみ有効。"""
+        if not self._initialized or not self._paused:
+            return
+        try:
+            self._pygame.mixer.unpause()  # 全チャンネルを再開
+            self._paused = False
+            self._param_changed_event.set()
+        except Exception as e:
+            print(f"[AudioEngine] resume失敗: {e}")
+
+    def is_paused(self) -> bool:
+        """一時停止中かどうかを返す。"""
+        return self._paused
 
     def is_playing(self) -> bool:
-        """いずれかのトラックが再生中かどうかを返す。"""
+        """再生中（ポーズ中を含む）かどうかを返す。"""
         if not self._initialized or not self._playing:
             return False
         if self._stop_event.is_set():
@@ -449,6 +478,12 @@ class AudioEngine:
 
         # メインループ：チャンクを継続的に供給
         while not self._stop_event.is_set():
+            # ポーズ中はチャンク供給を停止して待機
+            if self._paused:
+                self._param_changed_event.wait(timeout=0.05)
+                self._param_changed_event.clear()
+                continue
+
             all_done = True
             any_solo = any(t.solo for t in tracks)
 

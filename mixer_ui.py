@@ -1012,6 +1012,10 @@ class Colors:
     BTN_PLAY_HOV   = "#2ecc71"
     BTN_STOP       = "#c0392b"
     BTN_STOP_HOV   = "#e74c3c"
+    BTN_PAUSE      = "#d4a017"
+    BTN_PAUSE_HOV  = "#f0c040"
+    BTN_RESUME     = "#2980b9"
+    BTN_RESUME_HOV = "#3498db"
     BTN_EXPORT     = "#6c3483"
     BTN_EXPORT_HOV = "#8e44ad"
     BTN_SAVE       = "#1a5276"
@@ -3184,6 +3188,13 @@ class MixerMainWindow(QMainWindow):
         self._play_btn.clicked.connect(self._on_play)
         outer.addWidget(self._play_btn)
 
+        self._pause_btn = QPushButton("⏸  PAUSE")
+        self._pause_btn.setFixedSize(120, 40)
+        self._pause_btn.setEnabled(False)  # 初期は無効（再生中のみ有効）
+        self._pause_btn.setStyleSheet(self._transport_btn_style(Colors.BTN_PAUSE, Colors.BTN_PAUSE_HOV))
+        self._pause_btn.clicked.connect(self._on_pause)
+        outer.addWidget(self._pause_btn)
+
         self._stop_btn = QPushButton("■  STOP")
         self._stop_btn.setFixedSize(120, 40)
         self._stop_btn.setStyleSheet(self._transport_btn_style(Colors.BTN_STOP, Colors.BTN_STOP_HOV))
@@ -3377,6 +3388,13 @@ class MixerMainWindow(QMainWindow):
             self._playing_indicator.setStyleSheet(f"color: {Colors.METER_LOW}; font-size: 16px;")
         else:
             self._playing_indicator.setStyleSheet(f"color: #333; font-size: 16px;")
+            # 再生終了時（トラックが最後まで再生し終わった場合）にボタンをリセット
+            if self._pause_btn.isEnabled():
+                self._play_btn.setEnabled(True)
+                self._pause_btn.setEnabled(False)
+                self._pause_btn.setText("⏸  PAUSE")
+                self._pause_btn.setStyleSheet(
+                    self._transport_btn_style(Colors.BTN_PAUSE, Colors.BTN_PAUSE_HOV))
 
         # REC STOPボタンのリアルタイム更新（録音中のみ）
         if self._master_widget and self._engine._rec_active:
@@ -3530,10 +3548,40 @@ class MixerMainWindow(QMainWindow):
             return
         self._engine.play_all(self._tracks)
         self._set_status("Playing...")
+        # ボタン状態遷移: 再生中
+        self._play_btn.setEnabled(False)
+        self._pause_btn.setEnabled(True)
+        self._pause_btn.setText("⏸  PAUSE")
+        self._pause_btn.setStyleSheet(
+            self._transport_btn_style(Colors.BTN_PAUSE, Colors.BTN_PAUSE_HOV))
+
+    def _on_pause(self):
+        if self._engine.is_paused():
+            # ポーズ中 → 再開
+            self._engine.resume()
+            self._set_status("Playing...")
+            self._pause_btn.setText("⏸  PAUSE")
+            self._pause_btn.setStyleSheet(
+                self._transport_btn_style(Colors.BTN_PAUSE, Colors.BTN_PAUSE_HOV))
+            self._play_btn.setEnabled(False)
+        else:
+            # 再生中 → ポーズ
+            self._engine.pause()
+            self._set_status("⏸ Paused")
+            self._pause_btn.setText("▶  RESUME")
+            self._pause_btn.setStyleSheet(
+                self._transport_btn_style(Colors.BTN_RESUME, Colors.BTN_RESUME_HOV))
+            self._play_btn.setEnabled(False)
 
     def _on_stop(self):
         self._engine.stop_all()
         self._set_status("Stopped")
+        # ボタン状態遷移: 停止中
+        self._play_btn.setEnabled(True)
+        self._pause_btn.setEnabled(False)
+        self._pause_btn.setText("⏸  PAUSE")
+        self._pause_btn.setStyleSheet(
+            self._transport_btn_style(Colors.BTN_PAUSE, Colors.BTN_PAUSE_HOV))
 
     def _on_master_volume_changed(self, volume: float):
         self._engine.set_master_volume(volume)
