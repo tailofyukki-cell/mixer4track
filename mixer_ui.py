@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (
     QMessageBox, QProgressDialog, QComboBox, QSpacerItem,
     QDialog, QDialogButtonBox, QListWidget, QListWidgetItem
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, pyqtSlot, QPoint
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, pyqtSlot, QPoint, QRectF
 from PyQt5.QtGui import (
     QPainter, QColor, QFont, QPen, QBrush, QPalette
 )
