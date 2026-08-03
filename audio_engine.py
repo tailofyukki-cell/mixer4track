@@ -818,6 +818,28 @@ class AudioEngine:
             return 0.0
         return len(pcm) / SAMPLE_RATE
 
+    def get_track_position_sec(self, track_id: int) -> float:
+        """指定トラックの現在再生位置（秒）を返す。再生中以外は 0.0。"""
+        with self._lock:
+            s = self._streamers.get(track_id)
+        if s is None:
+            return 0.0
+        return s.get_pos_sec()
+
+    def seek_track(self, track_id: int, pos_sec: float):
+        """指定トラックの再生位置を秒単位でシークする。再生中のみ有効。"""
+        with self._lock:
+            s = self._streamers.get(track_id)
+            pcm = self._pcm_data.get(track_id)
+        if s is None or pcm is None:
+            return
+        total_samples = len(pcm)
+        target = int(max(0.0, min(pos_sec, total_samples / SAMPLE_RATE)) * SAMPLE_RATE)
+        with s._lock:
+            s._pos = target
+        # パラメータ変更イベントを発火してストリームループに即座反映させる
+        self._param_changed_event.set()
+
     # ------------------------------------------------------------------
     # 録音制御（REC START / REC STOP）
     # ------------------------------------------------------------------

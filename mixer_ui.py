@@ -120,19 +120,50 @@ class ExpandedSpectrumWindow(QWidget):
     """
 
     def __init__(self, title: str, accent_color: str = "#4a90d9",
-                 is_geq: bool = False, parent=None):
+                 is_geq: bool = False, parent=None,
+                 track_id: int = -1):
         super().__init__(parent, Qt.Window)
         self._accent = accent_color
         self._is_geq = is_geq
         self._db_range = 18.0
         self._response: list = []
         self._spectrum_bands = None
+        self._track_id = track_id
 
         self.setWindowTitle(title)
-        self.resize(600, 400)
-        self.setMinimumSize(400, 260)
+        self.resize(600, 440)
+        self.setMinimumSize(400, 300)
         self.setStyleSheet("background-color: #0d1117;")
         self.setAttribute(Qt.WA_DeleteOnClose, True)
+
+        # シークバー（ウィンドウ下部に配置）
+        self._seek_bar = TrackSeekBar(accent_color=accent_color, parent=self)
+        self._seek_bar.seeked.connect(self._on_seeked)
+        self._seek_bar.setGeometry(0, 400, 600, 36)
+
+    def _on_seeked(self, pos_sec: float):
+        """シークバー操作時のコールバック。親ウィンドウのエンジンにシークを依頼する。"""
+        parent = self.parent()
+        while parent is not None:
+            if hasattr(parent, '_engine'):
+                parent._engine.seek_track(self._track_id, pos_sec)
+                break
+            parent = parent.parent() if hasattr(parent, 'parent') else None
+
+    def update_seek_bar(self, pos_sec: float, duration_sec: float):
+        """シークバーの位置と総時間を更新する。"""
+        self._seek_bar.set_position(pos_sec)
+        if self._seek_bar._duration_sec != duration_sec:
+            self._seek_bar.set_duration(duration_sec)
+
+    def set_seek_bar_peaks(self, peaks: list):
+        """波形サムネイルデータをシークバーに設定する。"""
+        self._seek_bar.set_peaks(peaks)
+
+    def resizeEvent(self, event):
+        """ウィンドウリサイズ時にシークバーを下部に定位する。"""
+        h = self.height()
+        self._seek_bar.setGeometry(0, h - 36, self.width(), 36)
 
     # ------------------------------------------------------------------
     # データ更新（親ウィジェットから呼ばれる）
@@ -320,10 +351,18 @@ class EQCurveView(QWidget):
             self._expanded_win.activateWindow()
             return
         title = f"EQ Spectrum - {self._track_label}" if self._track_label else "EQ Spectrum"
+        # track_idを抽出（ラベルが 'Track N' 形式の場合）
+        _tid = -1
+        if self._track_label and self._track_label.startswith("Track "):
+            try:
+                _tid = int(self._track_label.split(" ")[1]) - 1
+            except (ValueError, IndexError):
+                pass
         win = ExpandedSpectrumWindow(
             title=title,
             accent_color=self._accent,
-            is_geq=False
+            is_geq=False,
+            track_id=_tid
         )
         win.update_curve(self._response)
         win.update_spectrum(self._spectrum_bands)
@@ -1119,6 +1158,144 @@ class EffectWorker(QThread):
     def run(self):
         self._engine.update_effect(self._track_id, self._preset_name, self._enabled)
         self.finished.emit(self._track_id)
+
+
+# ===========================================================================
+# シークバーウィジェット
+# ===========================================================================
+class TrackSeekBar(QWidget):
+    """
+    トラックの再生位置を表示・操作するシークバー。
+    - ドラッグまたはクリックでシーク位置を指定。
+    - 波形サムネイル（ピークリスト）を表示。
+    - 現在位置・総時間をテキストで表示。
+    """
+    # シークしたときに発火（秒単位）
+    seeked = pyqtSignal(float)
+
+    def __init__(self, accent_color: str = "#4a90d9", parent=None):
+        super().__init__(parent)
+        self._accent = accent_color
+        self._pos_sec: float = 0.0
+        self._duration_sec: float = 0.0
+        self._peaks: list = []          # 波形サムネイル（正規化済み 0.0、1.0）
+        self._dragging: bool = False
+        self.setMinimumHeight(28)
+        self.setMaximumHeight(36)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("クリックまたはドラッグでシーク")
+
+    def set_peaks(self, peaks: list):
+        """波形サムネイルデータを設定する。"""
+        self._peaks = peaks
+        self.update()
+
+    def set_duration(self, duration_sec: float):
+        """総再生時間（秒）を設定する。"""
+        self._duration_sec = max(0.0, duration_sec)
+        self.update()
+
+    def set_position(self, pos_sec: float):
+        """現在再生位置（秒）を設定する。ドラッグ中は無視。"""
+        if self._dragging:
+            return
+        self._pos_sec = max(0.0, pos_sec)
+        self.update()
+
+    @staticmethod
+    def _fmt_sec(sec: float) -> str:
+        m = int(sec // 60)
+        s = sec % 60
+        return f"{m}:{s:04.1f}"
+
+    def _pos_to_x(self, pos_sec: float) -> int:
+        if self._duration_sec <= 0:
+            return 0
+        w = self.width() - 4
+        return 2 + int(pos_sec / self._duration_sec * w)
+
+    def _x_to_pos(self, x: int) -> float:
+        if self._duration_sec <= 0:
+            return 0.0
+        w = self.width() - 4
+        ratio = max(0.0, min(1.0, (x - 2) / w))
+        return ratio * self._duration_sec
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._dragging = True
+            self._pos_sec = self._x_to_pos(event.x())
+            self.update()
+            self.seeked.emit(self._pos_sec)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            self._pos_sec = self._x_to_pos(event.x())
+            self.update()
+            self.seeked.emit(self._pos_sec)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._dragging = False
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        margin_x = 2
+        bar_y = h - 8
+        bar_h = 5
+        wave_h = bar_y - 2
+
+        # 背景
+        painter.fillRect(0, 0, w, h, QColor("#1a1a1a"))
+
+        # 波形サムネイル
+        if self._peaks:
+            n = len(self._peaks)
+            wave_color = QColor(self._accent)
+            wave_color.setAlpha(80)
+            played_color = QColor(self._accent)
+            played_color.setAlpha(160)
+            pos_ratio = (self._pos_sec / self._duration_sec
+                         if self._duration_sec > 0 else 0.0)
+            for i, peak in enumerate(self._peaks):
+                bx = margin_x + int(i * (w - margin_x * 2) / n)
+                bw = max(1, int((w - margin_x * 2) / n) - 1)
+                bh = max(1, int(peak * wave_h))
+                by = wave_h - bh
+                ratio_i = i / n
+                c = played_color if ratio_i <= pos_ratio else wave_color
+                painter.fillRect(bx, by, bw, bh, c)
+
+        # バー軌道（グレー）
+        painter.fillRect(margin_x, bar_y, w - margin_x * 2, bar_h, QColor("#333333"))
+
+        # 再生済み部分（アクセント色）
+        if self._duration_sec > 0:
+            played_w = int(self._pos_sec / self._duration_sec * (w - margin_x * 2))
+            if played_w > 0:
+                painter.fillRect(margin_x, bar_y, played_w, bar_h, QColor(self._accent))
+
+        # ツマミ
+        thumb_x = self._pos_to_x(self._pos_sec)
+        thumb_r = 5
+        painter.setBrush(QBrush(QColor("#ffffff")))
+        painter.setPen(QPen(QColor(self._accent), 1.5))
+        painter.drawEllipse(thumb_x - thumb_r, bar_y + bar_h // 2 - thumb_r,
+                            thumb_r * 2, thumb_r * 2)
+
+        # 時間テキスト
+        painter.setFont(QFont("Arial", 7))
+        painter.setPen(QPen(QColor("#888888"), 1))
+        pos_str = self._fmt_sec(self._pos_sec)
+        dur_str = self._fmt_sec(self._duration_sec)
+        painter.drawText(margin_x + 2, 0, 60, wave_h,
+                         Qt.AlignLeft | Qt.AlignVCenter, pos_str)
+        painter.drawText(w - 62, 0, 60, wave_h,
+                         Qt.AlignRight | Qt.AlignVCenter, dur_str)
+
+        painter.end()
 
 
 # ===========================================================================
@@ -2269,6 +2446,11 @@ class TrackWidget(QFrame):
         self._eq_curve = EQCurveView(accent_color=self._accent)
         self._eq_curve.set_track_label(f"Track {self._track.track_id}")
         layout.addWidget(self._eq_curve)
+
+        # シークバー（EQカーブの下）
+        self._seek_bar = TrackSeekBar(accent_color=self._accent)
+        self._seek_bar.seeked.connect(self._on_seeked)
+        layout.addWidget(self._seek_bar)
         layout.addStretch()
 
     def _btn_style(self, active: bool, is_mute: bool) -> str:
@@ -2423,6 +2605,27 @@ class TrackWidget(QFrame):
     def clear_eq_curve(self):
         """EQカーブをフラットに戻す。"""
         self._eq_curve.clear()
+
+    def update_seek_bar(self, pos_sec: float, duration_sec: float):
+        """シークバーの位置と総時間を更新する。"""
+        self._seek_bar.set_position(pos_sec)
+        if self._seek_bar._duration_sec != duration_sec:
+            self._seek_bar.set_duration(duration_sec)
+
+    def set_seek_bar_peaks(self, peaks: list):
+        """波形サムネイルデータをシークバーに設定する。"""
+        self._seek_bar.set_peaks(peaks)
+
+    def _on_seeked(self, pos_sec: float):
+        """シークバー操作時のコールバック。親ウィンドウのエンジンにシークを依頼するため、
+        シグナルではなく親ウィンドウを直接呼び出す方式を使う。"""
+        # 親ウィンドウを探してシークを依頼する
+        parent = self.parent()
+        while parent is not None:
+            if hasattr(parent, '_engine') and hasattr(parent, '_tracks'):
+                parent._engine.seek_track(self._track.track_id, pos_sec)
+                break
+            parent = parent.parent() if hasattr(parent, 'parent') else None
 
     def restore_state(self, track: TrackModel):
         """プロジェクト読み込み時にUIを復元する。"""
@@ -3350,6 +3553,18 @@ class MixerMainWindow(QMainWindow):
             except Exception:
                 pass
 
+            # シークバー更新
+            try:
+                pos = self._engine.get_track_position_sec(track.track_id)
+                dur = self._engine.get_sound_duration(track.track_id)
+                tw.update_seek_bar(pos, dur)
+                # 拡大ウィンドウにも同期
+                if (tw._eq_curve._expanded_win is not None
+                        and not tw._eq_curve._expanded_win.isHidden()):
+                    tw._eq_curve._expanded_win.update_seek_bar(pos, dur)
+            except Exception:
+                pass
+
         # MASTERメーター
         if is_playing:
             avg = sum(self._pseudo_levels) / max(len(self._pseudo_levels), 1)
@@ -3456,6 +3671,14 @@ class MixerMainWindow(QMainWindow):
                 high_gain_db=track.eq_high_gain,
             )
             self._track_widgets[track_id].update_eq_curve(eq_params)
+            # 波形サムネイルをシークバーに設定
+            try:
+                peaks = self._engine.get_waveform_peaks(track_id, num_points=200)
+                self._track_widgets[track_id].set_seek_bar_peaks(peaks)
+                dur = self._engine.get_sound_duration(track_id)
+                self._track_widgets[track_id].update_seek_bar(0.0, dur)
+            except Exception:
+                pass
             self._set_status(f"Track {track_id + 1}: {os.path.basename(path)} loaded")
         else:
             QMessageBox.warning(self, "Load Error",

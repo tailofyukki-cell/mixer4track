@@ -1,6 +1,6 @@
-# Mixer4Track  [Phase 17]
+# Mixer4Track  [Phase 18]
 
-16トラック音楽ミキサーソフト — Phase 17: PAUSEボタン（一時停止）追加版
+16トラック音楽ミキサーソフト — Phase 18: シークバー追加版
 
 ## 概要
 
@@ -284,6 +284,21 @@ mixer4track/
 ### Phase 16: アナログ针式VUメーター追加
 
 ### Phase 17: PAUSEボタン（一時停止）追加
+
+### Phase 18: シークバー追加
+- **`audio_engine.py`** に `get_track_position_sec()` / `seek_track()` メソッドを追加
+  - `get_track_position_sec(track_id)`: 再生中のトラックの現在位置（秒）を返す
+  - `seek_track(track_id, pos_sec)`: 再生位置を秒単位でシーク（再生中のみ有効）
+- **`TrackSeekBar`** ウィジェットを新規実装
+  - 波形サムネイル（再生済み部分をアクセント色で表示）
+  - バー軌道（グレー）・再生済み部分（アクセント色）・ツマミ（白丸）
+  - 現在位置・総時間を「0:12.3 / 3:45.0」形式で表示
+  - クリック・ドラッグでシーク位置を指定
+- 各 **TrackWidget** の EQカーブの下にシークバーを配置
+- **ExpandedSpectrumWindow**（ダブルクリック拡大ウィンドウ）の下部にもシークバーを追加
+  - ウィンドウリサイズに対応（`resizeEvent`で下部に定位）
+  - メイン画面のシークバーとリアルタイム同期
+- ファイル読み込み完了時に波形サムネイルを自動設定
 - **`audio_engine.py`** に `pause()` / `resume()` / `is_paused()` メソッドを追加
   - `pygame.mixer.pause()` / `unpause()` で全チャンネルを一時停止・再開
   - `_stream_loop` 内でポーズ中はチャンク供給を停止して待機
@@ -325,9 +340,9 @@ mixer4track/
 ## 将来拡張ロードマップ
 | Phase | 機能 |
 |-------|------|
-| Phase 18 | MIDI コントローラー対応 |
-| Phase 19 | MP3 書き出し（lameenc 統合） |
-| Phase 20 | オートメーション（フェーダー・パンの時間軸変化） |
+| Phase 19 | MIDI コントローラー対応 |
+| Phase 20 | MP3 書き出し（lameenc 統合） |
+| Phase 21 | オートメーション（フェーダー・パンの時間軸変化） |
 
 ---
 *Created by Manus AI — 100日チャレンジ*
