@@ -2237,6 +2237,7 @@ class TrackWidget(QFrame):
     effect_changed      = pyqtSignal(int, str, bool)  # (track_id, preset_name, enabled)
     geq_band_changed    = pyqtSignal(int, float, float)  # (track_id, band_freq, gain_db)
     mic_toggled         = pyqtSignal(int)  # (track_id) - MICボタンクリック時
+    aux_toggled         = pyqtSignal(int)  # (track_id) - AUXボタンクリック時
 
     # キーボードショートカット（バンク内インデックス 0～7）
     KEY_LABELS = ["A / Z", "S / X", "D / C", "F / V", "G / B", "H / N", "J / M", "K / ,"]
@@ -2360,26 +2361,32 @@ class TrackWidget(QFrame):
         self._eq_widget.eq_changed.connect(self.eq_changed)
         layout.addWidget(self._eq_widget)
 
-        # ミュート / ソロ / MIC
+        # ミュート / ソロ / MIC / AUX
         ms_layout = QHBoxLayout()
-        ms_layout.setSpacing(4)
+        ms_layout.setSpacing(3)
         self._mute_btn = QPushButton("M")
-        self._mute_btn.setFixedSize(28, 24)
+        self._mute_btn.setFixedSize(26, 22)
         self._solo_btn = QPushButton("S")
-        self._solo_btn.setFixedSize(28, 24)
+        self._solo_btn.setFixedSize(26, 22)
         self._mic_btn = QPushButton("MIC")
-        self._mic_btn.setFixedSize(34, 24)
+        self._mic_btn.setFixedSize(30, 22)
         self._mic_btn.setToolTip("マイク入力を割り当てる")
+        self._aux_btn = QPushButton("AUX")
+        self._aux_btn.setFixedSize(30, 22)
+        self._aux_btn.setToolTip("AUX ON: このトラックにのみFXを適用")
         self._mute_btn.setStyleSheet(self._btn_style(False, is_mute=True))
         self._solo_btn.setStyleSheet(self._btn_style(False, is_mute=False))
         self._mic_btn.setStyleSheet(self._mic_btn_style(False))
+        self._aux_btn.setStyleSheet(self._aux_btn_style(False))
         self._mute_btn.clicked.connect(lambda: self.mute_toggled.emit(self._track.track_id))
         self._solo_btn.clicked.connect(lambda: self.solo_toggled.emit(self._track.track_id))
         self._mic_btn.clicked.connect(lambda: self.mic_toggled.emit(self._track.track_id))
+        self._aux_btn.clicked.connect(lambda: self.aux_toggled.emit(self._track.track_id))
         ms_layout.addStretch()
         ms_layout.addWidget(self._mute_btn)
         ms_layout.addWidget(self._solo_btn)
         ms_layout.addWidget(self._mic_btn)
+        ms_layout.addWidget(self._aux_btn)
         ms_layout.addStretch()
         layout.addLayout(ms_layout)
 
@@ -2484,6 +2491,28 @@ class TrackWidget(QFrame):
             }}
             QPushButton:hover {{ background-color: {hover}; }}
         """
+
+    def _aux_btn_style(self, active: bool) -> str:
+        """AUXボタンのスタイルを返す。active=Trueのとき点灯（パープル）。"""
+        bg = "#6c3483" if active else "#333333"
+        border = "#9b59b6" if active else "#444"
+        hover = "#8e44ad" if active else "#555"
+        return f"""
+            QPushButton {{
+                background-color: {bg}; color: {Colors.TEXT_PRIMARY};
+                border: 1px solid {border}; border-radius: 3px;
+                font-size: 9px; font-weight: bold;
+            }}
+            QPushButton:hover {{ background-color: {hover}; }}
+        """
+
+    def update_aux_state(self, active: bool):
+        """AUXボタンの点灯状態を更新する。"""
+        self._aux_btn.setStyleSheet(self._aux_btn_style(active))
+        self._aux_btn.setToolTip(
+            "AUX ON: このトラックにのみFXを適用中" if active
+            else "AUX ON: このトラックにのみFXを適用"
+        )
 
     def update_mic_state(self, active: bool, device_name: str = ""):
         """MICボタンの点灯状態を更新する。"""
@@ -2637,6 +2666,7 @@ class TrackWidget(QFrame):
         self._pan_label.setText(track.get_pan_display())
         self._mute_btn.setStyleSheet(self._btn_style(track.muted, is_mute=True))
         self._solo_btn.setStyleSheet(self._btn_style(track.solo, is_mute=False))
+        self.update_aux_state(track.aux_enabled)
         self._file_label.setText(track.get_file_display_name())
         # ゲインを復元
         self._gain_slider.blockSignals(True)
@@ -3300,6 +3330,7 @@ class MixerMainWindow(QMainWindow):
             tw.solo_toggled.connect(self._on_solo_toggled)
             tw.eq_changed.connect(self._on_eq_changed)
             tw.mic_toggled.connect(self._on_mic_toggled)
+            tw.aux_toggled.connect(self._on_aux_toggled)
             self._track_widgets.append(tw)
             layout.addWidget(tw)
 
@@ -3745,6 +3776,18 @@ class MixerMainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, "MIC エラー",
                     f"マイクデバイスの引き当てに失敗しました。\nデバイス: {dev_name}")
+
+    def _on_aux_toggled(self, track_id: int):
+        """
+        AUXボタンクリック時のコールバック。
+        AUX状態をトグルし、エンジンに即座反映する。
+        """
+        track = self._tracks[track_id]
+        track.aux_enabled = not track.aux_enabled
+        self._track_widgets[track_id].update_aux_state(track.aux_enabled)
+        self._engine.set_aux_track(track_id, track.aux_enabled)
+        state = "ON" if track.aux_enabled else "OFF"
+        self._set_status(f"Track {track_id + 1}: AUX {state} — FXは{'AUX ONトラックのみ' if track.aux_enabled else '全トラックに適用'}に変更")
 
     def _on_eq_changed(self, track_id: int, params):
         """

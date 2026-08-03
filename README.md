@@ -1,6 +1,6 @@
-# Mixer4Track  [Phase 18]
+# Mixer4Track  [Phase 19]
 
-16トラック音楽ミキサーソフト — Phase 18: シークバー追加版
+16トラック音楽ミキサーソフト — Phase 19: AUXボタン追加版
 
 ## 概要
 
@@ -286,6 +286,18 @@ mixer4track/
 ### Phase 17: PAUSEボタン（一時停止）追加
 
 ### Phase 18: シークバー追加
+
+### Phase 19: AUXボタン追加
+- **`track_model.py`** に `aux_enabled` フラグを追加（プロジェクト保存/読み込みに対応）
+- **`audio_engine.py`** の `_TrackStreamer` に `aux_enabled` フラグを追加
+  - `set_aux(enabled)`: AUX ON/OFFをスレッドセーフに設定
+  - `next_chunk()` 内のエフェクト適用条件を `aux_enabled == True` のときのみに変更
+  - `AudioEngine.set_aux_track(track_id, enabled)`: 再生中は次チャンクから即反映
+- **`mixer_ui.py`** の `TrackWidget` に **AUXボタン**を追加
+  - M / S / MIC / AUX の4ボタンが横並びに配置（各ボタンを小さくして全部収納）
+  - AUX ON時はパープル色で点灯
+  - `_on_aux_toggled`: AUXトグル・エンジン反映・ステータスバー表示
+  - プロジェクト読み込み時に `restore_state()` でAUX状態を復元
 - **`audio_engine.py`** に `get_track_position_sec()` / `seek_track()` メソッドを追加
   - `get_track_position_sec(track_id)`: 再生中のトラックの現在位置（秒）を返す
   - `seek_track(track_id, pos_sec)`: 再生位置を秒単位でシーク（再生中のみ有効）
@@ -340,9 +352,9 @@ mixer4track/
 ## 将来拡張ロードマップ
 | Phase | 機能 |
 |-------|------|
-| Phase 19 | MIDI コントローラー対応 |
-| Phase 20 | MP3 書き出し（lameenc 統合） |
-| Phase 21 | オートメーション（フェーダー・パンの時間軸変化） |
+| Phase 20 | MIDI コントローラー対応 |
+| Phase 21 | MP3 書き出し（lameenc 統合） |
+| Phase 22 | オートメーション（フェーダー・パンの時間軸変化） |
 
 ---
 *Created by Manus AI — 100日チャレンジ*

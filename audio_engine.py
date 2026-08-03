@@ -84,6 +84,7 @@ class _TrackStreamer:
         self._eq_params: EQParams = EQParams()
         self._effect_preset: str = "None"
         self._effect_enabled: bool = False
+        self._aux_enabled: bool = False  # AUX ON: TrueのトラックのみにFXを適用
 
         # DSPエンジン（チャンク生成スレッドのみが使用）
         self._eq_engine = EQEngine(sample_rate)
@@ -106,6 +107,13 @@ class _TrackStreamer:
             self._effect_preset = preset_name
             self._effect_enabled = enabled
             # エフェクトが無効化された場合は内部バッファをリセット
+            if not enabled:
+                self._effect_engine.reset_state()
+
+    def set_aux(self, enabled: bool):
+        """AUX ON/OFFを設定する。TrueのときのみFXを適用する。"""
+        with self._lock:
+            self._aux_enabled = enabled
             if not enabled:
                 self._effect_engine.reset_state()
 
@@ -153,8 +161,8 @@ class _TrackStreamer:
             # EQ適用（常に apply_eq を呼び、内部で Flat 時はバイパスしつつ _prev_last_sample を更新する）
             chunk = self._eq_engine.apply_eq(chunk)
 
-            # エフェクト適用
-            if self._effect_enabled and self._effect_preset != "None":
+            # エフェクト適用（AUX ONのトラックのみ適用）
+            if self._effect_enabled and self._effect_preset != "None" and self._aux_enabled:
                 chunk = self._effect_engine.apply(chunk, self._effect_preset)
 
             # クリップ
@@ -194,6 +202,7 @@ class AudioEngine:
         self._eq_params: Dict[int, EQParams] = {}
         self._effect_presets: Dict[int, str] = {}
         self._effect_enabled: Dict[int, bool] = {}
+        self._aux_enabled: Dict[int, bool] = {}  # AUX ON/OFFフラグ
 
         # pygame チャンネル
         self._channels: Dict[int, Optional[object]] = {}
@@ -333,6 +342,14 @@ class AudioEngine:
         if s is not None:
             s.set_effect(preset_name, enabled)
 
+    def set_aux_track(self, track_id: int, enabled: bool):
+        """AUX ON/OFFを設定する。再生中は次チャンクから即反映。"""
+        self._aux_enabled[track_id] = enabled
+        with self._lock:
+            s = self._streamers.get(track_id)
+        if s is not None:
+            s.set_aux(enabled)
+
     # ------------------------------------------------------------------
     # 再生制御
     # ------------------------------------------------------------------
@@ -358,6 +375,7 @@ class AudioEngine:
                     self._effect_presets.get(track.track_id, "None"),
                     self._effect_enabled.get(track.track_id, False)
                 )
+                s.set_aux(self._aux_enabled.get(track.track_id, False))
                 self._streamers[track.track_id] = s
                 self._channels[track.track_id] = None
 

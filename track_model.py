@@ -30,6 +30,7 @@ class TrackModel:
     eq_enabled: bool = True              # EQ ON/OFF
     effect_preset: str = "None"           # エフェクトプリセット名（Phase 6）
     effect_enabled: bool = False          # エフェクト ON/OFF（Phase 6）
+    aux_enabled: bool = False             # AUX ON/OFF: TrueのトラックのみにFXを適用（Phase 19）
     gain_db: float = 0.0                  # 入力ゲイン補正 -24dB〜+24dB（Phase 7）
     waveform_data: Optional[list] = field(default=None, repr=False)  # 波形データ
 
@@ -94,6 +95,7 @@ class TrackModel:
             "effect_preset":  self.effect_preset,
             "effect_enabled": self.effect_enabled,
             "gain_db":        self.gain_db,
+            "aux_enabled":    self.aux_enabled,
         }
 
     @classmethod
@@ -117,4 +119,5 @@ class TrackModel:
             effect_preset=data.get("effect_preset",  "None"),
             effect_enabled=data.get("effect_enabled", False),
             gain_db=data.get("gain_db", 0.0),
+            aux_enabled=data.get("aux_enabled", False),
         )
