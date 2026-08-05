@@ -1,6 +1,6 @@
 """
 main.py
-Mixer4Track — 4トラック音楽ミキサー
+Mixer4Track — 16トラック音楽ミキサー
 エントリーポイント
 """
 
