@@ -2026,21 +2026,21 @@ class AnalogVUMeterWidget(QWidget):
         painter.drawEllipse(int(cx - pivot_r), int(cy - pivot_r),
                             pivot_r * 2, pivot_r * 2)
 
-        # PEAK LED（右上）
+        # PEAK LED（右上）— クリップ時のみ表示
         led_x = int(cx + radius * 0.62)
         led_y = int(cy - radius * 0.30)
         led_r = max(4, int(radius * 0.10))
-        blink_on = (self._clip_blink // 5) % 2 == 0
-        led_color = QColor("#ff2222") if (clip_flag and blink_on) else \
-                    (QColor("#880000") if clip_flag else QColor("#3a1010"))
-        painter.setBrush(QBrush(led_color))
-        painter.setPen(QPen(QColor("#222222"), 1))
-        painter.drawEllipse(led_x - led_r, led_y - led_r, led_r * 2, led_r * 2)
-        # PEAKラベル
-        painter.setFont(QFont("Arial", max(4, int(radius * 0.09))))
-        painter.setPen(QPen(QColor("#555555"), 1))
-        painter.drawText(led_x - led_r * 2, led_y + led_r + 1,
-                         led_r * 4, 10, Qt.AlignCenter, "PEAK")
+        if clip_flag:
+            blink_on = (self._clip_blink // 5) % 2 == 0
+            led_color = QColor("#ff2222") if blink_on else QColor("#880000")
+            painter.setBrush(QBrush(led_color))
+            painter.setPen(QPen(QColor("#222222"), 1))
+            painter.drawEllipse(led_x - led_r, led_y - led_r, led_r * 2, led_r * 2)
+            # PEAKラベル
+            painter.setFont(QFont("Arial", max(4, int(radius * 0.09))))
+            painter.setPen(QPen(QColor("#cc0000"), 1))
+            painter.drawText(led_x - led_r * 2, led_y + led_r + 1,
+                             led_r * 4, 10, Qt.AlignCenter, "PEAK")
 
         # チャンネルラベル（VU文字の代わりに）
         painter.setFont(QFont("Arial", max(6, int(radius * 0.14)), QFont.Bold))
@@ -4231,8 +4231,21 @@ class MixerMainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event):
+        # タイマー停止
         self._timer.stop()
+        # エクスポートワーカー待機
         if self._export_worker and self._export_worker.isRunning():
             self._export_worker.wait(3000)
+        # オーディオエンジンクリーンアップ
         self._engine.cleanup()
+        # 全サブウィンドウを閉じる（拡大表示ウィンドウ・トラックサブウィンドウなど）
+        from PyQt5.QtWidgets import QApplication as _QApp
+        for w in _QApp.topLevelWidgets():
+            if w is not self:
+                try:
+                    w.close()
+                except Exception:
+                    pass
         event.accept()
+        # アプリケーションを完全終了
+        _QApp.quit()
