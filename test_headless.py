@@ -174,7 +174,7 @@ def test_project_store_16tracks():
         # 読み込み
         result = store.load()
         assert result is not None, "読み込み失敗"
-        loaded_tracks, loaded_master, loaded_bank = result
+        loaded_tracks, loaded_master, loaded_bank, _marker_data = result
 
         assert len(loaded_tracks) == 16, f"トラック数不一致: {len(loaded_tracks)}"
         assert abs(loaded_master - master_vol) < 1e-4
@@ -190,7 +190,7 @@ def test_project_store_16tracks():
         store2.save(tracks, master_volume=1.0, current_bank=0)
         r2 = store2.load()
         assert r2 is not None
-        _, _, bank2 = r2
+        _, _, bank2, _m = r2
         assert bank2 == 0, f"バンクA不一致: {bank2}"
         print(f"    bank A: OK (bank={bank2})")
 
@@ -361,7 +361,7 @@ def test_project_store_eq():
 
         result = store.load()
         assert result is not None, "load failed"
-        loaded_tracks, master_vol, bank = result
+        loaded_tracks, master_vol, bank, _markers = result
         assert abs(master_vol - 1.2) < 0.001
         assert bank == 1
         assert len(loaded_tracks) == 16
@@ -448,7 +448,7 @@ def test_project_store_effect():
 
         result = store.load()
         assert result is not None, "load failed"
-        loaded_tracks, _, _ = result
+        loaded_tracks, _, _, _m = result
         assert len(loaded_tracks) == 16
         for i, t in enumerate(loaded_tracks):
             assert t.effect_preset  == "Reverb: Hall",  f"track {i}: preset mismatch"
@@ -496,7 +496,7 @@ def test_gain_model():
         store.save(tracks)
         result = store.load()
         assert result is not None
-        loaded_tracks, _, _ = result
+        loaded_tracks, _, _, _m = result
         assert abs(loaded_tracks[3].gain_db - 6.0) < 0.001, f"ゲイン保存エラー: {loaded_tracks[3].gain_db}"
         assert abs(loaded_tracks[7].gain_db - (-12.0)) < 0.001, f"ゲイン保存エラー: {loaded_tracks[7].gain_db}"
         assert loaded_tracks[0].gain_db == 0.0, f"デフォルトゲインエラー: {loaded_tracks[0].gain_db}"

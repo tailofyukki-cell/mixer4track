@@ -1161,6 +1161,157 @@ class EffectWorker(QThread):
 
 
 # ===========================================================================
+# マーカーバーウィジェット
+# ===========================================================================
+class MarkerBar(QWidget):
+    """
+    タイムラインマーカーを表示するバー。
+    - マーカーを三角形のフラグで表示する。
+    - クリックでそのマーカー位置にジャンプ（marker_clickedシグナル）。
+    - 右クリックでコンテキストメニュー（削除・名前変更）。
+    """
+    marker_clicked = pyqtSignal(float)          # ジャンプ先（秒）
+    marker_delete_requested = pyqtSignal(int)   # 削除要求（marker_id）
+    marker_rename_requested = pyqtSignal(int, str)  # 名前変更要求（marker_id, new_label）
+
+    MARKER_COLOR   = "#ffd700"   # 通常マーカー色（ゴールド）
+    HOVER_COLOR    = "#ffffff"   # ホバー時の色
+    FLAG_W         = 10          # フラグ三角形の幅
+    FLAG_H         = 10          # フラグ三角形の高さ
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._markers: list = []          # Markerオブジェクトのリスト
+        self._duration_sec: float = 0.0
+        self._hovered_id: int = -1
+        self.setMinimumHeight(18)
+        self.setMaximumHeight(18)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def set_markers(self, markers: list, duration_sec: float):
+        """マーカーリストと総時間を更新して再描画する。"""
+        self._markers = list(markers)
+        self._duration_sec = max(0.0, duration_sec)
+        self.update()
+
+    def set_duration(self, duration_sec: float):
+        self._duration_sec = max(0.0, duration_sec)
+        self.update()
+
+    def _time_to_x(self, time_sec: float) -> int:
+        if self._duration_sec <= 0:
+            return 0
+        w = self.width() - 4
+        return 2 + int(time_sec / self._duration_sec * w)
+
+    def _marker_at(self, x: int, y: int) -> int:
+        """クリック位置に最も近いマーカーIDを返す（なければ-1）。"""
+        for m in self._markers:
+            mx = self._time_to_x(m.time_sec)
+            if abs(x - mx) <= self.FLAG_W:
+                return m.marker_id
+        return -1
+
+    def mousePressEvent(self, event):
+        mid = self._marker_at(event.x(), event.y())
+        if event.button() == Qt.LeftButton and mid >= 0:
+            m = next((mk for mk in self._markers if mk.marker_id == mid), None)
+            if m:
+                self.marker_clicked.emit(m.time_sec)
+        elif event.button() == Qt.RightButton and mid >= 0:
+            self._show_context_menu(mid, event.globalPos())
+
+    def mouseMoveEvent(self, event):
+        mid = self._marker_at(event.x(), event.y())
+        if mid != self._hovered_id:
+            self._hovered_id = mid
+            self.update()
+            if mid >= 0:
+                m = next((mk for mk in self._markers if mk.marker_id == mid), None)
+                if m:
+                    self.setToolTip(f"{m.get_display_label()}")
+            else:
+                self.setToolTip("")
+
+    def leaveEvent(self, event):
+        self._hovered_id = -1
+        self.update()
+
+    def _show_context_menu(self, marker_id: int, global_pos):
+        from PyQt5.QtWidgets import QMenu, QAction
+        m = next((mk for mk in self._markers if mk.marker_id == marker_id), None)
+        if not m:
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { background: #222; color: #fff; border: 1px solid #444; }
+            QMenu::item:selected { background: #444; }
+        """)
+        rename_act = menu.addAction(f"名前を変更: {m.get_display_label()}")
+        delete_act = menu.addAction("削除")
+        act = menu.exec_(global_pos)
+        if act == rename_act:
+            from PyQt5.QtWidgets import QInputDialog
+            new_label, ok = QInputDialog.getText(
+                self, "マーカー名の変更",
+                "新しい名前を入力してください:",
+                text=m.label
+            )
+            if ok:
+                self.marker_rename_requested.emit(marker_id, new_label)
+        elif act == delete_act:
+            self.marker_delete_requested.emit(marker_id)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # 背景
+        painter.fillRect(0, 0, w, h, QColor("#111111"))
+
+        # 中央の細い横線
+        painter.setPen(QPen(QColor("#333333"), 1))
+        painter.drawLine(2, h // 2, w - 2, h // 2)
+
+        if not self._markers or self._duration_sec <= 0:
+            painter.end()
+            return
+
+        for m in self._markers:
+            mx = self._time_to_x(m.time_sec)
+            is_hovered = (m.marker_id == self._hovered_id)
+            color = QColor(self.HOVER_COLOR if is_hovered else self.MARKER_COLOR)
+
+            # 縦線
+            painter.setPen(QPen(color, 1))
+            painter.drawLine(mx, 0, mx, h)
+
+            # 三角形フラグ（上向き）
+            from PyQt5.QtGui import QPolygon
+            from PyQt5.QtCore import QPoint
+            triangle = QPolygon([
+                QPoint(mx, h - 2),
+                QPoint(mx - self.FLAG_W // 2, h - 2 - self.FLAG_H),
+                QPoint(mx + self.FLAG_W // 2, h - 2 - self.FLAG_H),
+            ])
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.NoPen)
+            painter.drawPolygon(triangle)
+
+            # ラベル（ホバー時のみ表示）
+            if is_hovered:
+                label = m.get_display_label()
+                painter.setFont(QFont("Arial", 8))
+                painter.setPen(QPen(QColor("#ffffff"), 1))
+                lx = min(mx + 4, w - 80)
+                painter.drawText(lx, 0, 80, h, Qt.AlignLeft | Qt.AlignVCenter, label)
+
+        painter.end()
+
+
+# ===========================================================================
 # シークバーウィジェット
 # ===========================================================================
 class TrackSeekBar(QWidget):
@@ -3225,6 +3376,11 @@ class MixerMainWindow(QMainWindow):
         self._current_project_path: Optional[str] = None
         self._current_bank: int = 0   # 0=Bank A (1-8), 1=Bank B (9-16)
 
+        # Phase 20: マーカーマネージャー
+        from project_store import MarkerManager
+        self._marker_manager = MarkerManager()
+        self._marker_bar: Optional["MarkerBar"] = None
+
         # GEQモード状態
         self._geq_mode: str = "off"  # 'low' / 'hi' / 'off'
         self._geq_params: GEQParams = GEQParams()
@@ -3299,6 +3455,13 @@ class MixerMainWindow(QMainWindow):
 
         main_layout.addWidget(self._track_area_container, stretch=1)
         main_layout.addWidget(self._build_transport())
+
+        # Phase 20: マーカーバー
+        self._marker_bar = MarkerBar()
+        self._marker_bar.marker_clicked.connect(self._on_marker_jump)
+        self._marker_bar.marker_delete_requested.connect(self._on_marker_delete)
+        self._marker_bar.marker_rename_requested.connect(self._on_marker_rename)
+        main_layout.addWidget(self._marker_bar)
 
         # ステータスバー
         self._status_label = QLabel("Load files and press PLAY  |  [BANK A: 1-8] active")
@@ -3461,6 +3624,34 @@ class MixerMainWindow(QMainWindow):
         outer.addWidget(self._open_btn)
 
         outer.addStretch()
+
+        # Phase 20: ADD MARKERボタン
+        self._add_marker_btn = QPushButton("▼  ADD MARKER")
+        self._add_marker_btn.setFixedSize(130, 32)
+        self._add_marker_btn.setStyleSheet(self._transport_btn_style("#5d4037", "#795548", font_size=10))
+        self._add_marker_btn.setToolTip("現在の再生位置にマーカーを追加")
+        self._add_marker_btn.clicked.connect(self._on_add_marker)
+        outer.addWidget(self._add_marker_btn)
+
+        # マーカーリストドロップダウン
+        self._marker_combo = QComboBox()
+        self._marker_combo.setFixedSize(160, 32)
+        self._marker_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: #222; color: #ffd700; border: 1px solid #5d4037;
+                border-radius: 4px; padding-left: 8px; font-size: 11px;
+            }}
+            QComboBox::drop-down {{ border: none; }}
+            QComboBox QAbstractItemView {{
+                background: #222; color: #ffd700; border: 1px solid #5d4037;
+                selection-background-color: #5d4037;
+            }}
+        """)
+        self._marker_combo.addItem("▼ マーカーにジャンプ")
+        self._marker_combo.currentIndexChanged.connect(self._on_marker_combo_jump)
+        outer.addWidget(self._marker_combo)
+
+        outer.addStretch()
         return transport
 
     @staticmethod
@@ -3535,7 +3726,8 @@ class MixerMainWindow(QMainWindow):
 
         store = ProjectStore(project_path=path)
         master_vol = self._engine.get_master_volume()
-        ok = store.save(self._tracks, master_volume=master_vol, current_bank=self._current_bank)
+        ok = store.save(self._tracks, master_volume=master_vol, current_bank=self._current_bank,
+                        markers=self._marker_manager.get_all())
         if ok:
             if self._current_project_path is None:
                 self._current_project_path = path
@@ -3979,6 +4171,88 @@ class MixerMainWindow(QMainWindow):
             """)
         self._set_status(f"REC: 録音完了 ({dur_str}) | EXPORT WAVで書き出せます")
 
+    # ------------------------------------------------------------------
+    # Phase 20: マーカー機能
+    # ------------------------------------------------------------------
+
+    def _on_add_marker(self):
+        """現在の再生位置にマーカーを追加する。"""
+        # 現在再生位置を全トラックから取得（再生中のトラックの位置を使用）
+        pos_sec = 0.0
+        for i in range(self.NUM_TRACKS):
+            p = self._engine.get_track_position_sec(i)
+            if p > 0.0:
+                pos_sec = p
+                break
+
+        from PyQt5.QtWidgets import QInputDialog
+        label, ok = QInputDialog.getText(
+            self, "マーカーを追加",
+            f"マーカー名（空白で時間表示）:",
+            text=""
+        )
+        if not ok:
+            return
+        marker = self._marker_manager.add(pos_sec, label.strip())
+        self._refresh_marker_ui()
+        m = int(pos_sec // 60)
+        s = pos_sec % 60
+        self._set_status(f"マーカー追加: {marker.get_display_label()} @ {m}:{s:04.1f}")
+
+    def _on_marker_jump(self, time_sec: float):
+        """マーカーバークリックで指定位置にシークする。"""
+        for i in range(self.NUM_TRACKS):
+            if self._tracks[i].file_path:
+                self._engine.seek_track(i, time_sec)
+        m = int(time_sec // 60)
+        s = time_sec % 60
+        self._set_status(f"マーカージャンプ: {m}:{s:04.1f}")
+
+    def _on_marker_delete(self, marker_id: int):
+        """マーカーを削除する。"""
+        self._marker_manager.remove(marker_id)
+        self._refresh_marker_ui()
+        self._set_status("マーカーを削除しました")
+
+    def _on_marker_rename(self, marker_id: int, new_label: str):
+        """マーカー名を変更する。"""
+        self._marker_manager.rename(marker_id, new_label)
+        self._refresh_marker_ui()
+
+    def _on_marker_combo_jump(self, index: int):
+        """ドロップダウンからマーカーにジャンプする。"""
+        if index <= 0:
+            return
+        markers = self._marker_manager.get_all()
+        idx = index - 1  # 先頭の「マーカーにジャンプ」分を引く
+        if 0 <= idx < len(markers):
+            self._on_marker_jump(markers[idx].time_sec)
+        # 選択を先頭に戻す
+        self._marker_combo.blockSignals(True)
+        self._marker_combo.setCurrentIndex(0)
+        self._marker_combo.blockSignals(False)
+
+    def _refresh_marker_ui(self):
+        """マーカーバーとドロップダウンを更新する。"""
+        markers = self._marker_manager.get_all()
+        # 最長トラックの総時間を取得
+        duration = 0.0
+        for i in range(self.NUM_TRACKS):
+            d = self._engine.get_track_duration_sec(i)
+            if d > duration:
+                duration = d
+        if self._marker_bar:
+            self._marker_bar.set_markers(markers, duration)
+        # ドロップダウンを更新
+        self._marker_combo.blockSignals(True)
+        self._marker_combo.clear()
+        self._marker_combo.addItem("▼ マーカーにジャンプ")
+        for m in markers:
+            mi = int(m.time_sec // 60)
+            ms = m.time_sec % 60
+            self._marker_combo.addItem(f"{m.get_display_label()}  [{mi}:{ms:04.1f}]")
+        self._marker_combo.blockSignals(False)
+
     def _on_export(self):
         """録音バッファをWAVに書き出す。"""
         if not self._engine.has_rec_data():
@@ -4082,7 +4356,8 @@ class MixerMainWindow(QMainWindow):
     def _save_to_path(self, path: str):
         store = ProjectStore(project_path=path)
         master_vol = self._engine.get_master_volume()
-        ok = store.save(self._tracks, master_volume=master_vol, current_bank=self._current_bank)
+        ok = store.save(self._tracks, master_volume=master_vol, current_bank=self._current_bank,
+                        markers=self._marker_manager.get_all())
         if ok:
             self._current_project_path = path
             self._update_project_label(path)
@@ -4108,7 +4383,7 @@ class MixerMainWindow(QMainWindow):
             QMessageBox.critical(self, "Open Error", f"Failed to load project:\n{path}")
             return
 
-        tracks, master_vol, saved_bank = result
+        tracks, master_vol, saved_bank, marker_data = result
 
         self._engine.stop_all()
 
@@ -4160,6 +4435,11 @@ class MixerMainWindow(QMainWindow):
         self._bank_a_widget.setVisible(saved_bank == 0)
         self._bank_b_widget.setVisible(saved_bank == 1)
         self._update_bank_buttons()
+
+        # Phase 20: マーカーを復元
+        self._marker_manager.clear()
+        self._marker_manager.load_from_list(marker_data)
+        self._refresh_marker_ui()
 
         self._current_project_path = path
         self._update_project_label(path)
