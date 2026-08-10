@@ -213,3 +213,317 @@ class ProjectStore:
         ]
         files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         return files[:max_count]
+
+
+# ===========================================================================
+# Phase 21: UNDO/REDO コマンドパターン
+# ===========================================================================
+
+from abc import ABC, abstractmethod
+from collections import deque
+from typing import Callable, Any
+
+
+class Command(ABC):
+    """
+    UNDO/REDOコマンドの基底クラス。
+    execute()で操作を実行し、undo()で元に戻す。
+    """
+
+    @abstractmethod
+    def execute(self):
+        """操作を実行する（REDOにも使用）。"""
+
+    @abstractmethod
+    def undo(self):
+        """操作を元に戻す。"""
+
+    @property
+    def description(self) -> str:
+        """操作の説明文（ステータスバー表示用）。"""
+        return self.__class__.__name__
+
+
+class VolumeCommand(Command):
+    """フェーダー音量変更コマンド。"""
+
+    def __init__(self, track_id: int, old_vol: float, new_vol: float,
+                 apply_fn: Callable[[int, float], None], label_fn: Callable[[int, float], None]):
+        self._track_id = track_id
+        self._old = old_vol
+        self._new = new_vol
+        self._apply = apply_fn      # (track_id, volume) → None
+        self._label = label_fn      # UIラベル更新 (track_id, volume) → None
+
+    def execute(self):
+        self._apply(self._track_id, self._new)
+        self._label(self._track_id, self._new)
+
+    def undo(self):
+        self._apply(self._track_id, self._old)
+        self._label(self._track_id, self._old)
+
+    @property
+    def description(self):
+        return f"Track {self._track_id + 1} 音量変更"
+
+
+class PanCommand(Command):
+    """PAN変更コマンド。"""
+
+    def __init__(self, track_id: int, old_pan: float, new_pan: float,
+                 apply_fn: Callable[[int, float], None], label_fn: Callable[[int, float], None]):
+        self._track_id = track_id
+        self._old = old_pan
+        self._new = new_pan
+        self._apply = apply_fn
+        self._label = label_fn
+
+    def execute(self):
+        self._apply(self._track_id, self._new)
+        self._label(self._track_id, self._new)
+
+    def undo(self):
+        self._apply(self._track_id, self._old)
+        self._label(self._track_id, self._old)
+
+    @property
+    def description(self):
+        return f"Track {self._track_id + 1} PAN変更"
+
+
+class GainCommand(Command):
+    """GAIN変更コマンド。"""
+
+    def __init__(self, track_id: int, old_gain: float, new_gain: float,
+                 apply_fn: Callable[[int, float], None], label_fn: Callable[[int, float], None]):
+        self._track_id = track_id
+        self._old = old_gain
+        self._new = new_gain
+        self._apply = apply_fn
+        self._label = label_fn
+
+    def execute(self):
+        self._apply(self._track_id, self._new)
+        self._label(self._track_id, self._new)
+
+    def undo(self):
+        self._apply(self._track_id, self._old)
+        self._label(self._track_id, self._old)
+
+    @property
+    def description(self):
+        return f"Track {self._track_id + 1} GAIN変更"
+
+
+class MuteCommand(Command):
+    """MUTE ON/OFFコマンド。"""
+
+    def __init__(self, track_id: int, old_muted: bool, new_muted: bool,
+                 apply_fn: Callable[[int, bool], None]):
+        self._track_id = track_id
+        self._old = old_muted
+        self._new = new_muted
+        self._apply = apply_fn
+
+    def execute(self):
+        self._apply(self._track_id, self._new)
+
+    def undo(self):
+        self._apply(self._track_id, self._old)
+
+    @property
+    def description(self):
+        return f"Track {self._track_id + 1} MUTE {'ON' if self._new else 'OFF'}"
+
+
+class SoloCommand(Command):
+    """SOLO ON/OFFコマンド。"""
+
+    def __init__(self, track_id: int, old_solo: bool, new_solo: bool,
+                 apply_fn: Callable[[int, bool], None]):
+        self._track_id = track_id
+        self._old = old_solo
+        self._new = new_solo
+        self._apply = apply_fn
+
+    def execute(self):
+        self._apply(self._track_id, self._new)
+
+    def undo(self):
+        self._apply(self._track_id, self._old)
+
+    @property
+    def description(self):
+        return f"Track {self._track_id + 1} SOLO {'ON' if self._new else 'OFF'}"
+
+
+class AuxCommand(Command):
+    """AUX ON/OFFコマンド。"""
+
+    def __init__(self, track_id: int, old_aux: bool, new_aux: bool,
+                 apply_fn: Callable[[int, bool], None]):
+        self._track_id = track_id
+        self._old = old_aux
+        self._new = new_aux
+        self._apply = apply_fn
+
+    def execute(self):
+        self._apply(self._track_id, self._new)
+
+    def undo(self):
+        self._apply(self._track_id, self._old)
+
+    @property
+    def description(self):
+        return f"Track {self._track_id + 1} AUX {'ON' if self._new else 'OFF'}"
+
+
+class EQCommand(Command):
+    """EQパラメータ変更コマンド。"""
+
+    def __init__(self, track_id: int, old_params, new_params,
+                 apply_fn: Callable[[int, Any], None]):
+        self._track_id = track_id
+        self._old = old_params
+        self._new = new_params
+        self._apply = apply_fn
+
+    def execute(self):
+        self._apply(self._track_id, self._new)
+
+    def undo(self):
+        self._apply(self._track_id, self._old)
+
+    @property
+    def description(self):
+        return f"Track {self._track_id + 1} EQ変更"
+
+
+class MasterVolumeCommand(Command):
+    """マスター音量変更コマンド。"""
+
+    def __init__(self, old_vol: float, new_vol: float,
+                 apply_fn: Callable[[float], None]):
+        self._old = old_vol
+        self._new = new_vol
+        self._apply = apply_fn
+
+    def execute(self):
+        self._apply(self._new)
+
+    def undo(self):
+        self._apply(self._old)
+
+    @property
+    def description(self):
+        return "MASTER 音量変更"
+
+
+class FXCommand(Command):
+    """FXプリセット/ON/OFF変更コマンド。"""
+
+    def __init__(self, old_preset: str, old_enabled: bool,
+                 new_preset: str, new_enabled: bool,
+                 apply_fn: Callable[[str, bool], None]):
+        self._old_preset = old_preset
+        self._old_enabled = old_enabled
+        self._new_preset = new_preset
+        self._new_enabled = new_enabled
+        self._apply = apply_fn
+
+    def execute(self):
+        self._apply(self._new_preset, self._new_enabled)
+
+    def undo(self):
+        self._apply(self._old_preset, self._old_enabled)
+
+    @property
+    def description(self):
+        return f"FX変更: {self._new_preset}"
+
+
+class GEQCommand(Command):
+    """GEQバンド変更コマンド。"""
+
+    def __init__(self, band_freq: float, old_gain: float, new_gain: float,
+                 apply_fn: Callable[[float, float], None]):
+        self._band = band_freq
+        self._old = old_gain
+        self._new = new_gain
+        self._apply = apply_fn
+
+    def execute(self):
+        self._apply(self._band, self._new)
+
+    def undo(self):
+        self._apply(self._band, self._old)
+
+    @property
+    def description(self):
+        return f"GEQ {self._band:.0f}Hz 変更"
+
+
+class CommandHistory:
+    """
+    UNDO/REDOコマンド履歴を管理するクラス。
+    最大 MAX_HISTORY 件の操作を保持する。
+    """
+
+    MAX_HISTORY = 50
+
+    def __init__(self):
+        self._undo_stack: deque = deque(maxlen=self.MAX_HISTORY)
+        self._redo_stack: deque = deque()
+
+    def push(self, command: Command):
+        """コマンドを実行してUNDOスタックに積む。REDOスタックはクリアする。"""
+        self._undo_stack.append(command)
+        self._redo_stack.clear()
+
+    def undo(self) -> Optional[str]:
+        """
+        最後の操作を元に戻す。
+        成功時は操作の説明文を返す。スタックが空なら None を返す。
+        """
+        if not self._undo_stack:
+            return None
+        cmd = self._undo_stack.pop()
+        cmd.undo()
+        self._redo_stack.append(cmd)
+        return cmd.description
+
+    def redo(self) -> Optional[str]:
+        """
+        元に戻した操作をやり直す。
+        成功時は操作の説明文を返す。スタックが空なら None を返す。
+        """
+        if not self._redo_stack:
+            return None
+        cmd = self._redo_stack.pop()
+        cmd.execute()
+        self._undo_stack.append(cmd)
+        return cmd.description
+
+    def can_undo(self) -> bool:
+        return len(self._undo_stack) > 0
+
+    def can_redo(self) -> bool:
+        return len(self._redo_stack) > 0
+
+    def clear(self):
+        """履歴を全クリアする（プロジェクト読み込み時など）。"""
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+
+    def undo_description(self) -> str:
+        """次のUNDO操作の説明文を返す。"""
+        if self._undo_stack:
+            return self._undo_stack[-1].description
+        return ""
+
+    def redo_description(self) -> str:
+        """次のREDO操作の説明文を返す。"""
+        if self._redo_stack:
+            return self._redo_stack[-1].description
+        return ""

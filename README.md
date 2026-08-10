@@ -1,6 +1,6 @@
-# Mixer4Track  [Phase 20]
+# Mixer4Track  [Phase 21]
 
-16トラック音楽ミキサーソフト — Phase 20: マーカー機能追加版
+16トラック音楽ミキサーソフト — Phase 21: UNDO/REDO機能追加版
 
 ## 概要
 
@@ -361,12 +361,23 @@ mixer4track/
   - マーカーはプロジェクトファイル（.m4t）に保存・復元対応（スキーマバージョン 8.0）
   - **`project_store.py`** に `Marker` データクラスと `MarkerManager` クラスを追加
 
+### Phase 21
+- **UNDO/REDO機能**（最大履歴数: 50件）
+  - **対象操作**: フェーダー音量・PAN・GAIN・MUTE/SOLO/AUX・EQ・GEQ・FX・マスター音量
+  - **`CommandHistory`** クラス: コマンドパターンベースで履歴を管理（`deque(maxlen=50)`）
+  - **各コマンドクラス**: `VolumeCommand` / `PanCommand` / `GainCommand` / `MuteCommand` / `SoloCommand` / `AuxCommand` / `EQCommand` / `MasterVolumeCommand` / `FXCommand` / `GEQCommand`
+  - **UNDOボタン** (↶ UNDO) ・ **REDOボタン** (REDO ↷): トランスポートバー左端に配置。履歴なしの時は無効表示
+  - **トールチップ**: ボタンに次の操作内容を表示
+  - **キーボードショートカット**: Ctrl+Z = UNDO, Ctrl+Y / Ctrl+Shift+Z = REDO
+  - **`project_store.py`** に全コマンドクラスと `CommandHistory` を追加
+  - **`TrackWidget`** に `set_volume_silent` / `set_pan_silent` / `set_gain_silent` メソッドを追加（UNDO時のUI更新用）
+
 ## 将来拡張ロードマップ
 | Phase | 機能 |
 |-------|------|
-| Phase 21 | MIDI コントローラー対応 |
-| Phase 22 | MP3 書き出し（lameenc 統合） |
-| Phase 23 | オートメーション（フェーダー・パンの時間軸変化） |
+| Phase 22 | MIDI コントローラー対応 |
+| Phase 23 | MP3 書き出し（lameenc 統合） |
+| Phase 24 | オートメーション（フェーダー・パンの時間軸変化） |
 
 ---
 *Created by Manus AI — 100日チャレンジ*

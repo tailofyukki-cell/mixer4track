@@ -2836,6 +2836,34 @@ class TrackWidget(QFrame):
         # EQカーブを復元
         self._eq_curve.update_curve(eq_params)
 
+    def set_volume_silent(self, volume: float):
+        """シグナルを発火せずにフェーダーとラベルを更新（UNDO/REDO用）。"""
+        self._fader.blockSignals(True)
+        self._fader.set_value(int(volume * 100), emit=False)
+        self._fader.blockSignals(False)
+        self._vol_label.setText(f"{int(volume * 100)}%")
+        import math
+        if volume <= 0:
+            self._db_label.setText("-inf dB")
+        else:
+            db = 20 * math.log10(volume)
+            self._db_label.setText(f"{db:+.1f} dB")
+
+    def set_pan_silent(self, pan: float):
+        """シグナルを発火せずにPANスライダーとラベルを更新（UNDO/REDO用）。"""
+        self._pan_slider.blockSignals(True)
+        self._pan_slider.setValue(int(pan * 100))
+        self._pan_slider.blockSignals(False)
+        self._track.pan = pan
+        self._pan_label.setText(self._track.get_pan_display())
+
+    def set_gain_silent(self, gain_db: float):
+        """シグナルを発火せずにGAINスライダーとラベルを更新（UNDO/REDO用）。"""
+        self._gain_slider.blockSignals(True)
+        self._gain_slider.setValue(int(round(gain_db)))
+        self._gain_slider.blockSignals(False)
+        self._gain_label.setText(self._format_gain(gain_db))
+
 
 # ===========================================================================
 # MASTERトラックウィジェット（TrackWidgetと同形式）
@@ -3381,6 +3409,12 @@ class MixerMainWindow(QMainWindow):
         self._marker_manager = MarkerManager()
         self._marker_bar: Optional["MarkerBar"] = None
 
+        # Phase 21: UNDO/REDOコマンド履歴
+        from project_store import CommandHistory
+        self._history = CommandHistory()
+        self._undo_btn = None   # トランスポートバーに追加後に参照
+        self._redo_btn = None
+
         # GEQモード状態
         self._geq_mode: str = "off"  # 'low' / 'hi' / 'off'
         self._geq_params: GEQParams = GEQParams()
@@ -3576,6 +3610,23 @@ class MixerMainWindow(QMainWindow):
         outer = QHBoxLayout(transport)
         outer.setContentsMargins(16, 8, 16, 8)
         outer.setSpacing(12)
+
+        # Phase 21: UNDO/REDOボタン（左端）
+        self._undo_btn = QPushButton("↶ UNDO")
+        self._undo_btn.setFixedSize(90, 32)
+        self._undo_btn.setEnabled(False)
+        self._undo_btn.setStyleSheet(self._transport_btn_style("#2c3e50", "#34495e", font_size=11))
+        self._undo_btn.setToolTip("UNDO (履歴なし)")
+        self._undo_btn.clicked.connect(self._on_undo)
+        outer.addWidget(self._undo_btn)
+
+        self._redo_btn = QPushButton("REDO ↷")
+        self._redo_btn.setFixedSize(90, 32)
+        self._redo_btn.setEnabled(False)
+        self._redo_btn.setStyleSheet(self._transport_btn_style("#2c3e50", "#34495e", font_size=11))
+        self._redo_btn.setToolTip("REDO (履歴なし)")
+        self._redo_btn.clicked.connect(self._on_redo)
+        outer.addWidget(self._redo_btn)
 
         outer.addStretch()
 
@@ -3908,36 +3959,86 @@ class MixerMainWindow(QMainWindow):
                 f"Could not load file:\n{path}\n\nPlease select a WAV or MP3 file.")
 
     def _on_volume_changed(self, track_id: int, volume: float):
+        from project_store import VolumeCommand
+        old_vol = self._tracks[track_id].volume
         self._tracks[track_id].volume = volume
         any_solo = any(t.solo for t in self._tracks)
         self._engine.update_track(self._tracks[track_id], any_solo)
+        # UNDO記録（値が変化した場合のみ）
+        if abs(old_vol - volume) > 0.001:
+            def _apply_vol(tid, v):
+                self._tracks[tid].volume = v
+                self._engine.update_track(self._tracks[tid], any(t.solo for t in self._tracks))
+            def _label_vol(tid, v):
+                self._track_widgets[tid].set_volume_silent(v)
+            cmd = VolumeCommand(track_id, old_vol, volume, _apply_vol, _label_vol)
+            self._history.push(cmd)
+            self._update_undo_redo_buttons()
 
     def _on_pan_changed(self, track_id: int, pan: float):
+        from project_store import PanCommand
+        old_pan = self._tracks[track_id].pan
         self._tracks[track_id].pan = pan
         any_solo = any(t.solo for t in self._tracks)
         self._engine.update_track(self._tracks[track_id], any_solo)
+        if abs(old_pan - pan) > 0.001:
+            def _apply_pan(tid, p):
+                self._tracks[tid].pan = p
+                self._engine.update_track(self._tracks[tid], any(t.solo for t in self._tracks))
+            def _label_pan(tid, p):
+                self._track_widgets[tid].set_pan_silent(p)
+            cmd = PanCommand(track_id, old_pan, pan, _apply_pan, _label_pan)
+            self._history.push(cmd)
+            self._update_undo_redo_buttons()
 
     def _on_gain_changed(self, track_id: int, gain_db: float):
         """
         ゲイン変更時のコールバック。
         TrackModelを更新し、AudioEngineに信号チェーン再生成を依頼する。
         """
+        from project_store import GainCommand
+        old_gain = self._tracks[track_id].gain_db
         self._tracks[track_id].gain_db = gain_db
         self._engine.update_gain(track_id, gain_db)
+        if abs(old_gain - gain_db) > 0.001:
+            def _apply_gain(tid, g):
+                self._tracks[tid].gain_db = g
+                self._engine.update_gain(tid, g)
+            def _label_gain(tid, g):
+                self._track_widgets[tid].set_gain_silent(g)
+            cmd = GainCommand(track_id, old_gain, gain_db, _apply_gain, _label_gain)
+            self._history.push(cmd)
+            self._update_undo_redo_buttons()
 
     def _on_mute_toggled(self, track_id: int):
+        from project_store import MuteCommand
         track = self._tracks[track_id]
-        track.muted = not track.muted
-        self._track_widgets[track_id].update_mute_state(track.muted)
-        self._engine.update_all_tracks(self._tracks)
-        self._set_status(f"Track {track_id + 1}: {'Muted' if track.muted else 'Unmuted'}")
+        old_muted = track.muted
+        new_muted = not track.muted
+        def _apply_mute(tid, v):
+            self._tracks[tid].muted = v
+            self._track_widgets[tid].update_mute_state(v)
+            self._engine.update_all_tracks(self._tracks)
+        _apply_mute(track_id, new_muted)
+        self._set_status(f"Track {track_id + 1}: {'Muted' if new_muted else 'Unmuted'}")
+        cmd = MuteCommand(track_id, old_muted, new_muted, _apply_mute)
+        self._history.push(cmd)
+        self._update_undo_redo_buttons()
 
     def _on_solo_toggled(self, track_id: int):
+        from project_store import SoloCommand
         track = self._tracks[track_id]
-        track.solo = not track.solo
-        self._track_widgets[track_id].update_solo_state(track.solo)
-        self._engine.update_all_tracks(self._tracks)
-        self._set_status(f"Track {track_id + 1}: Solo {'ON' if track.solo else 'OFF'}")
+        old_solo = track.solo
+        new_solo = not track.solo
+        def _apply_solo(tid, v):
+            self._tracks[tid].solo = v
+            self._track_widgets[tid].update_solo_state(v)
+            self._engine.update_all_tracks(self._tracks)
+        _apply_solo(track_id, new_solo)
+        self._set_status(f"Track {track_id + 1}: Solo {'ON' if new_solo else 'OFF'}")
+        cmd = SoloCommand(track_id, old_solo, new_solo, _apply_solo)
+        self._history.push(cmd)
+        self._update_undo_redo_buttons()
 
     def _on_mic_toggled(self, track_id: int):
         """
@@ -3974,12 +4075,20 @@ class MixerMainWindow(QMainWindow):
         AUXボタンクリック時のコールバック。
         AUX状態をトグルし、エンジンに即座反映する。
         """
+        from project_store import AuxCommand
         track = self._tracks[track_id]
-        track.aux_enabled = not track.aux_enabled
-        self._track_widgets[track_id].update_aux_state(track.aux_enabled)
-        self._engine.set_aux_track(track_id, track.aux_enabled)
-        state = "ON" if track.aux_enabled else "OFF"
-        self._set_status(f"Track {track_id + 1}: AUX {state} — FXは{'AUX ONトラックのみ' if track.aux_enabled else '全トラックに適用'}に変更")
+        old_aux = track.aux_enabled
+        new_aux = not track.aux_enabled
+        def _apply_aux(tid, v):
+            self._tracks[tid].aux_enabled = v
+            self._track_widgets[tid].update_aux_state(v)
+            self._engine.set_aux_track(tid, v)
+        _apply_aux(track_id, new_aux)
+        state = "ON" if new_aux else "OFF"
+        self._set_status(f"Track {track_id + 1}: AUX {state} — FXは{'AUX ONトラックのみ' if new_aux else '全トラックに適用'}に変更")
+        cmd = AuxCommand(track_id, old_aux, new_aux, _apply_aux)
+        self._history.push(cmd)
+        self._update_undo_redo_buttons()
 
     def _on_eq_changed(self, track_id: int, params):
         """
@@ -3987,7 +4096,17 @@ class MixerMainWindow(QMainWindow):
         TrackModelにEQパラメータを同期し、AudioEngineにリアルタイム適用を依頼する。
         EQ再生成はバックグラウンドで実行（UIFreeze防止）。
         """
+        from project_store import EQCommand
+        from eq_engine import EQParams
         track = self._tracks[track_id]
+        # 変更前のパラメータを保存
+        old_params = EQParams(
+            low_gain_db=track.eq_low_gain,
+            mid_gain_db=track.eq_mid_gain,
+            mid_freq_hz=track.eq_mid_freq,
+            mid_q=track.eq_mid_q,
+            high_gain_db=track.eq_high_gain,
+        )
         track.eq_low_gain  = params.low_gain_db
         track.eq_mid_gain  = params.mid_gain_db
         track.eq_mid_freq  = params.mid_freq_hz
@@ -3997,6 +4116,19 @@ class MixerMainWindow(QMainWindow):
         self._track_widgets[track_id].update_eq_curve(params)
         # リアルタイム反映（次チャンクから即適用）
         self._engine.update_eq(track_id, params)
+        # UNDO記録
+        def _apply_eq(tid, p):
+            t = self._tracks[tid]
+            t.eq_low_gain = p.low_gain_db
+            t.eq_mid_gain = p.mid_gain_db
+            t.eq_mid_freq = p.mid_freq_hz
+            t.eq_mid_q    = p.mid_q
+            t.eq_high_gain = p.high_gain_db
+            self._track_widgets[tid].update_eq_curve(p)
+            self._engine.update_eq(tid, p)
+        cmd = EQCommand(track_id, old_params, params, _apply_eq)
+        self._history.push(cmd)
+        self._update_undo_redo_buttons()
 
     def _on_play(self):
         loaded = [t for t in self._tracks if t.file_path is not None]
@@ -4042,9 +4174,19 @@ class MixerMainWindow(QMainWindow):
             self._transport_btn_style(Colors.BTN_PAUSE, Colors.BTN_PAUSE_HOV))
 
     def _on_master_volume_changed(self, volume: float):
+        from project_store import MasterVolumeCommand
+        old_vol = self._engine.get_master_volume()
         self._engine.set_master_volume(volume)
         if self._engine.is_playing():
             self._engine.update_all_tracks(self._tracks)
+        if abs(old_vol - volume) > 0.001:
+            def _apply_master_vol(v):
+                self._engine.set_master_volume(v)
+                if self._master_widget:
+                    self._master_widget.restore_state(v)
+            cmd = MasterVolumeCommand(old_vol, volume, _apply_master_vol)
+            self._history.push(cmd)
+            self._update_undo_redo_buttons()
 
     def _on_master_effect_changed(self, _track_id: int, preset_name: str, enabled: bool):
         """
@@ -4108,12 +4250,59 @@ class MixerMainWindow(QMainWindow):
         GEQモード中にフェーダーが動いたときのコールバック。
         GEQパラメータを更新してAudioEngineにリアルタイム反映する。
         """
+        from project_store import GEQCommand
+        old_gain = self._geq_params.get_gain(band_freq)
         self._geq_params.set_gain(band_freq, gain_db)
         # MASTERカーブを更新
         if self._master_widget:
             self._master_widget.update_geq_curve(self._geq_params)
         # AudioEngineにリアルタイム反映
         self._engine.update_master_geq(self._geq_params)
+        # UNDO記録
+        if abs(old_gain - gain_db) > 0.001:
+            def _apply_geq(freq, g):
+                self._geq_params.set_gain(freq, g)
+                if self._master_widget:
+                    self._master_widget.update_geq_curve(self._geq_params)
+                self._engine.update_master_geq(self._geq_params)
+            cmd = GEQCommand(band_freq, old_gain, gain_db, _apply_geq)
+            self._history.push(cmd)
+            self._update_undo_redo_buttons()
+
+    # ------------------------------------------------------------------
+    # Phase 21: UNDO / REDO
+    # ------------------------------------------------------------------
+
+    def _on_undo(self):
+        """UNDO操作を実行する。"""
+        desc = self._history.undo()
+        if desc:
+            self._set_status(f"UNDO: {desc}")
+        else:
+            self._set_status("UNDO: 履歴なし")
+        self._update_undo_redo_buttons()
+
+    def _on_redo(self):
+        """REDO操作を実行する。"""
+        desc = self._history.redo()
+        if desc:
+            self._set_status(f"REDO: {desc}")
+        else:
+            self._set_status("REDO: 履歴なし")
+        self._update_undo_redo_buttons()
+
+    def _update_undo_redo_buttons(self):
+        """ボタンの有効/無効とツールチップを更新する。"""
+        if self._undo_btn:
+            can = self._history.can_undo()
+            self._undo_btn.setEnabled(can)
+            desc = self._history.undo_description()
+            self._undo_btn.setToolTip(f"UNDO: {desc}" if desc else "UNDO (履歴なし)")
+        if self._redo_btn:
+            can = self._history.can_redo()
+            self._redo_btn.setEnabled(can)
+            desc = self._history.redo_description()
+            self._redo_btn.setToolTip(f"REDO: {desc}" if desc else "REDO (履歴なし)")
 
     # ------------------------------------------------------------------
     # Phase 14: REC START / REC STOP / EXPORT WAV
@@ -4455,6 +4644,20 @@ class MixerMainWindow(QMainWindow):
 
     def keyPressEvent(self, event):
         key = event.key()
+        mods = event.modifiers()
+
+        # Phase 21: Ctrl+Z = UNDO, Ctrl+Y / Ctrl+Shift+Z = REDO
+        if mods & Qt.ControlModifier:
+            if key == Qt.Key_Z:
+                if mods & Qt.ShiftModifier:
+                    self._on_redo()
+                else:
+                    self._on_undo()
+                return
+            elif key == Qt.Key_Y:
+                self._on_redo()
+                return
+
         # 現在のバンクの先頭トラックインデックス
         base = self._current_bank * self.TRACKS_PER_BANK
         # track_widgets のインデックスはグローバル track_id と一致
