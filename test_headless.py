@@ -552,6 +552,52 @@ def test_multi_track_playback():
 
 
 # ===========================================================================
+# Phase 22: ループ再生テスト
+# ===========================================================================
+def test_loop_playback():
+    """全体/範囲ループの状態管理と再生継続を検証する。"""
+    import time
+    print("=== Phase 22: ループ再生テスト ===")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        wav_path = os.path.join(tmpdir, "loop_source.wav")
+        _make_wav(wav_path, duration=0.35, amplitude=0.25)
+
+        engine = AudioEngine(num_tracks=1)
+        if not engine._initialized:
+            print("  pygame未初期化のためskip")
+            return
+        assert engine.load_file(0, wav_path), "ループテスト音源の読み込み失敗"
+        assert 0.34 <= engine.get_timeline_duration_sec() <= 0.36
+
+        # 不正な範囲は拒否される
+        assert engine.set_loop_range(0.20, 0.10) is False
+
+        # 指定範囲ループ（再生前に設定しても有効）
+        assert engine.set_loop_range(0.05, 0.15) is True
+        active, start, end = engine.get_loop_range()
+        assert active is True
+        assert abs(start - 0.05) < 0.001
+        assert abs(end - 0.15) < 0.001
+
+        engine.play_all([TrackModel(track_id=0)])
+        time.sleep(0.45)  # 元音源の長さより長く待ち、繰り返しを確認
+        assert engine.is_playing(), "範囲ループ中に再生が終了した"
+        pos = engine.get_track_position_sec(0)
+        assert 0.05 <= pos <= 0.15, f"再生位置がループ範囲外: {pos:.3f}s"
+
+        # 共通シークはループ範囲内へ丸められる
+        engine.seek_all_tracks(0.12)
+        time.sleep(0.05)
+        pos = engine.get_track_position_sec(0)
+        assert 0.05 <= pos <= 0.15, f"共通シーク後の位置が範囲外: {pos:.3f}s"
+
+        engine.clear_loop_range()
+        assert engine.is_loop_enabled() is False
+        engine.stop_all()
+    print("  ループ再生: OK")
+
+
+# ===========================================================================
 # build_windows.bat ASCII チェック
 # ===========================================================================
 def test_bat_ascii():
@@ -584,6 +630,7 @@ if __name__ == "__main__":
         test_project_store_effect()
         test_gain_model()
         test_multi_track_playback()
+        test_loop_playback()
         test_bat_ascii()
         print("\n=== 全テスト合格 ===")
         sys.exit(0)

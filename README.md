@@ -1,6 +1,6 @@
-# Mixer4Track  [Phase 21]
+# Mixer4Track  [Phase 22]
 
-16トラック音楽ミキサーソフト — Phase 21: UNDO/REDO機能追加版
+16トラック音楽ミキサーソフト — Phase 22: ループ再生機能追加版
 
 ## 概要
 
@@ -372,12 +372,25 @@ mixer4track/
   - **`project_store.py`** に全コマンドクラスと `CommandHistory` を追加
   - **`TrackWidget`** に `set_volume_silent` / `set_pan_silent` / `set_gain_silent` メソッドを追加（UNDO時のUI更新用）
 
+### Phase 22
+- **ループ再生機能**（トラック全体・任意範囲）
+  - **`↻ LOOP`** ボタン：ループ再生のON/OFF。範囲が未指定なら最長トラックの全体をループ
+  - **`IN` / `OUT`** ボタン：現在位置を開始点・終了点として指定し、その範囲を繰り返し再生
+  - **`ALL`** ボタン：読み込み済みトラックのうち最長の音源全体をループ範囲に設定
+  - ループ中の `↻ LOOP ON` ボタンには設定済みの範囲をツールチップ表示
+  - **MarkerBar** にシアン色の範囲ハイライトと `↻ LOOP` ラベルを表示
+  - 範囲変更時には事前にキューされた旧音声を破棄し、IN地点から即座に再開
+  - ループ境界ではEQ・エフェクトの内部状態をリセットし、反復時の残響持ち越しを防止
+  - 短いトラックはループの共通終端まで無音を出力し、全トラックの同期を維持
+  - **`AudioEngine`** に `set_loop_range()` / `clear_loop_range()` / `get_loop_range()` / `seek_all_tracks()` / `get_timeline_duration_sec()` を追加
+  - ループ状態のユニットテストと、メインウィンドウのUIスモークテストを追加
+
 ## 将来拡張ロードマップ
 | Phase | 機能 |
 |-------|------|
-| Phase 22 | MIDI コントローラー対応 |
-| Phase 23 | MP3 書き出し（lameenc 統合） |
-| Phase 24 | オートメーション（フェーダー・パンの時間軸変化） |
+| Phase 23 | MIDI コントローラー対応 |
+| Phase 24 | MP3 書き出し（lameenc 統合） |
+| Phase 25 | オートメーション（フェーダー・パンの時間軸変化） |
 
 ---
 *Created by Manus AI — 100日チャレンジ*

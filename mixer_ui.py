@@ -1184,6 +1184,10 @@ class MarkerBar(QWidget):
         self._markers: list = []          # Markerオブジェクトのリスト
         self._duration_sec: float = 0.0
         self._hovered_id: int = -1
+        # Phase 22: ループ範囲の表示状態
+        self._loop_enabled: bool = False
+        self._loop_start_sec: float = 0.0
+        self._loop_end_sec: float = 0.0
         self.setMinimumHeight(18)
         self.setMaximumHeight(18)
         self.setMouseTracking(True)
@@ -1197,6 +1201,13 @@ class MarkerBar(QWidget):
 
     def set_duration(self, duration_sec: float):
         self._duration_sec = max(0.0, duration_sec)
+        self.update()
+
+    def set_loop_range(self, enabled: bool, start_sec: float = 0.0, end_sec: float = 0.0):
+        """ループ範囲の表示状態を設定する。"""
+        self._loop_enabled = bool(enabled and end_sec > start_sec)
+        self._loop_start_sec = max(0.0, start_sec)
+        self._loop_end_sec = max(0.0, end_sec)
         self.update()
 
     def _time_to_x(self, time_sec: float) -> int:
@@ -1275,7 +1286,23 @@ class MarkerBar(QWidget):
         painter.setPen(QPen(QColor("#333333"), 1))
         painter.drawLine(2, h // 2, w - 2, h // 2)
 
-        if not self._markers or self._duration_sec <= 0:
+        # Phase 22: ループ範囲をシアンで強調表示
+        if self._loop_enabled and self._duration_sec > 0:
+            lx1 = self._time_to_x(self._loop_start_sec)
+            lx2 = self._time_to_x(self._loop_end_sec)
+            loop_fill = QColor("#00c8d7")
+            loop_fill.setAlpha(65)
+            painter.fillRect(min(lx1, lx2), 1, abs(lx2 - lx1), h - 2, loop_fill)
+            loop_pen = QPen(QColor("#00d8e8"), 2)
+            painter.setPen(loop_pen)
+            painter.drawLine(lx1, 0, lx1, h)
+            painter.drawLine(lx2, 0, lx2, h)
+            painter.setFont(QFont("Arial", 8, QFont.Bold))
+            painter.setPen(QPen(QColor("#7df7ff"), 1))
+            painter.drawText(lx1 + 3, 0, max(0, lx2 - lx1 - 6), h,
+                             Qt.AlignCenter, "↻ LOOP")
+
+        if self._duration_sec <= 0:
             painter.end()
             return
 
@@ -3415,6 +3442,14 @@ class MixerMainWindow(QMainWindow):
         self._undo_btn = None   # トランスポートバーに追加後に参照
         self._redo_btn = None
 
+        # Phase 22: ループ範囲と操作ボタン
+        self._loop_in_sec: Optional[float] = None
+        self._loop_out_sec: Optional[float] = None
+        self._loop_btn = None
+        self._loop_in_btn = None
+        self._loop_out_btn = None
+        self._loop_all_btn = None
+
         # GEQモード状態
         self._geq_mode: str = "off"  # 'low' / 'hi' / 'off'
         self._geq_params: GEQParams = GEQParams()
@@ -3648,6 +3683,36 @@ class MixerMainWindow(QMainWindow):
         self._stop_btn.setStyleSheet(self._transport_btn_style(Colors.BTN_STOP, Colors.BTN_STOP_HOV))
         self._stop_btn.clicked.connect(self._on_stop)
         outer.addWidget(self._stop_btn)
+
+        # Phase 22: ループ再生操作
+        self._loop_btn = QPushButton("↻  LOOP")
+        self._loop_btn.setFixedSize(102, 40)
+        self._loop_btn.setStyleSheet(self._transport_btn_style("#34495e", "#46637d", font_size=11))
+        self._loop_btn.setToolTip("ループ再生をON/OFF（範囲未指定時は全体をループ）")
+        self._loop_btn.clicked.connect(self._on_loop_toggled)
+        outer.addWidget(self._loop_btn)
+
+        self._loop_in_btn = QPushButton("IN")
+        self._loop_in_btn.setFixedSize(46, 32)
+        self._loop_in_btn.setStyleSheet(self._transport_btn_style("#164b56", "#1b6978", font_size=10))
+        self._loop_in_btn.setToolTip("現在位置をループ開始点に設定")
+        self._loop_in_btn.clicked.connect(self._on_loop_in)
+        outer.addWidget(self._loop_in_btn)
+
+        self._loop_out_btn = QPushButton("OUT")
+        self._loop_out_btn.setFixedSize(52, 32)
+        self._loop_out_btn.setEnabled(False)
+        self._loop_out_btn.setStyleSheet(self._transport_btn_style("#164b56", "#1b6978", font_size=10))
+        self._loop_out_btn.setToolTip("INより後の現在位置をループ終了点に設定")
+        self._loop_out_btn.clicked.connect(self._on_loop_out)
+        outer.addWidget(self._loop_out_btn)
+
+        self._loop_all_btn = QPushButton("ALL")
+        self._loop_all_btn.setFixedSize(52, 32)
+        self._loop_all_btn.setStyleSheet(self._transport_btn_style("#164b56", "#1b6978", font_size=10))
+        self._loop_all_btn.setToolTip("最長トラックの全体範囲をループ")
+        self._loop_all_btn.clicked.connect(self._on_loop_all)
+        outer.addWidget(self._loop_all_btn)
 
         self._playing_indicator = QLabel("●")
         self._playing_indicator.setStyleSheet(f"color: #333; font-size: 16px;")
@@ -3953,6 +4018,11 @@ class MixerMainWindow(QMainWindow):
                 self._track_widgets[track_id].update_seek_bar(0.0, dur)
             except Exception:
                 pass
+            # 最長トラックに合わせてマーカー/ループ範囲のスケールを更新
+            self._refresh_marker_ui()
+            if self._engine.is_loop_enabled() and self._marker_bar:
+                active, start, end = self._engine.get_loop_range()
+                self._marker_bar.set_loop_range(active, start, end)
             self._set_status(f"Track {track_id + 1}: {os.path.basename(path)} loaded")
         else:
             QMessageBox.warning(self, "Load Error",
@@ -4270,6 +4340,128 @@ class MixerMainWindow(QMainWindow):
             self._update_undo_redo_buttons()
 
     # ------------------------------------------------------------------
+    # Phase 22: ループ再生
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_time_sec(sec: float) -> str:
+        """秒を m:ss.s 形式に整形する。"""
+        return f"{int(sec // 60)}:{sec % 60:04.1f}"
+
+    def _get_timeline_position_sec(self) -> float:
+        """読み込み済みトラックから共通タイムライン上の現在位置を取得する。"""
+        for track in self._tracks:
+            if track.file_path:
+                return self._engine.get_track_position_sec(track.track_id)
+        return 0.0
+
+    def _on_loop_in(self):
+        """現在位置をループ開始点（IN）に設定する。"""
+        duration = self._engine.get_timeline_duration_sec()
+        if duration <= 0.0:
+            QMessageBox.information(self, "Loop", "先に少なくとも1つの音声ファイルを読み込んでください。")
+            return
+        pos = min(self._get_timeline_position_sec(),
+                  max(0.0, duration - 1.0 / self._engine.SAMPLE_RATE))
+        self._loop_in_sec = pos
+        self._loop_out_sec = None
+        # 既存のループは明示的に解除し、新しいOUT指定を待つ
+        if self._engine.is_loop_enabled():
+            self._engine.clear_loop_range()
+            if self._marker_bar:
+                self._marker_bar.set_loop_range(False)
+        self._update_loop_controls()
+        self._set_status(f"LOOP IN: {self._format_time_sec(pos)}  |  OUTを押して範囲を確定")
+
+    def _on_loop_out(self):
+        """現在位置をループ終了点（OUT）に設定し、範囲ループを有効化する。"""
+        if self._loop_in_sec is None:
+            QMessageBox.information(self, "Loop", "先にINを押してループ開始点を設定してください。")
+            return
+        duration = self._engine.get_timeline_duration_sec()
+        pos = min(self._get_timeline_position_sec(), duration)
+        # UI操作時の誤操作を避け、最低0.05秒の範囲を要求する
+        if pos <= self._loop_in_sec + 0.05:
+            QMessageBox.information(self, "Loop", "OUTはINより0.05秒以上後に設定してください。")
+            return
+        self._loop_out_sec = pos
+        self._apply_loop_range(self._loop_in_sec, self._loop_out_sec)
+
+    def _on_loop_all(self):
+        """最長トラックの全体範囲をループ対象に設定する。"""
+        duration = self._engine.get_timeline_duration_sec()
+        if duration <= 0.0:
+            QMessageBox.information(self, "Loop", "先に少なくとも1つの音声ファイルを読み込んでください。")
+            return
+        self._loop_in_sec = 0.0
+        self._loop_out_sec = duration
+        self._apply_loop_range(self._loop_in_sec, self._loop_out_sec)
+
+    def _on_loop_toggled(self):
+        """LOOPボタンでループ再生をON/OFFする。"""
+        if self._engine.is_loop_enabled():
+            self._clear_loop_range()
+            return
+
+        duration = self._engine.get_timeline_duration_sec()
+        if duration <= 0.0:
+            QMessageBox.information(self, "Loop", "先に少なくとも1つの音声ファイルを読み込んでください。")
+            return
+        # IN/OUTが確定済みなら選択範囲、なければトラック全体を採用
+        if (self._loop_in_sec is not None and self._loop_out_sec is not None
+                and self._loop_out_sec > self._loop_in_sec):
+            self._apply_loop_range(self._loop_in_sec, self._loop_out_sec)
+        else:
+            self._loop_in_sec = 0.0
+            self._loop_out_sec = duration
+            self._apply_loop_range(0.0, duration)
+
+    def _apply_loop_range(self, start_sec: float, end_sec: float):
+        """エンジンとUIにループ範囲を反映する。"""
+        if not self._engine.set_loop_range(start_sec, end_sec, enabled=True):
+            QMessageBox.warning(self, "Loop", "ループ範囲を設定できませんでした。INとOUTを確認してください。")
+            return
+        _, start, end = self._engine.get_loop_range()
+        self._loop_in_sec = start
+        self._loop_out_sec = end
+        if self._marker_bar:
+            self._marker_bar.set_loop_range(True, start, end)
+        self._update_loop_controls()
+        self._set_status(f"LOOP ON: {self._format_time_sec(start)} – {self._format_time_sec(end)}")
+
+    def _clear_loop_range(self):
+        """ループをOFFにし、範囲表示を解除する。"""
+        self._engine.clear_loop_range()
+        if self._marker_bar:
+            self._marker_bar.set_loop_range(False)
+        self._update_loop_controls()
+        self._set_status("LOOP OFF: 通常再生に戻りました")
+
+    def _update_loop_controls(self):
+        """ループの有効状態とIN/OUT状態に合わせてボタン表示を更新する。"""
+        active, start, end = self._engine.get_loop_range()
+        if self._loop_btn:
+            self._loop_btn.setText("↻  LOOP ON" if active else "↻  LOOP")
+            if active:
+                self._loop_btn.setStyleSheet(self._transport_btn_style("#007a88", "#0099a9", font_size=10))
+                self._loop_btn.setToolTip(
+                    f"LOOP ON: {self._format_time_sec(start)} – {self._format_time_sec(end)}（クリックでOFF）")
+            else:
+                self._loop_btn.setStyleSheet(self._transport_btn_style("#34495e", "#46637d", font_size=11))
+                self._loop_btn.setToolTip("ループ再生をON/OFF（範囲未指定時は全体をループ）")
+        if self._loop_in_btn:
+            self._loop_in_btn.setText("IN ●" if self._loop_in_sec is not None else "IN")
+            self._loop_in_btn.setToolTip(
+                f"LOOP IN: {self._format_time_sec(self._loop_in_sec)}" if self._loop_in_sec is not None
+                else "現在位置をループ開始点に設定")
+        if self._loop_out_btn:
+            self._loop_out_btn.setEnabled(self._loop_in_sec is not None)
+            self._loop_out_btn.setText("OUT ●" if self._loop_out_sec is not None else "OUT")
+            self._loop_out_btn.setToolTip(
+                f"LOOP OUT: {self._format_time_sec(self._loop_out_sec)}" if self._loop_out_sec is not None
+                else "INより後の現在位置をループ終了点に設定")
+
+    # ------------------------------------------------------------------
     # Phase 21: UNDO / REDO
     # ------------------------------------------------------------------
 
@@ -4389,10 +4581,8 @@ class MixerMainWindow(QMainWindow):
         self._set_status(f"マーカー追加: {marker.get_display_label()} @ {m}:{s:04.1f}")
 
     def _on_marker_jump(self, time_sec: float):
-        """マーカーバークリックで指定位置にシークする。"""
-        for i in range(self.NUM_TRACKS):
-            if self._tracks[i].file_path:
-                self._engine.seek_track(i, time_sec)
+        """マーカーバークリックで指定位置に全トラックを同期シークする。"""
+        self._engine.seek_all_tracks(time_sec)
         m = int(time_sec // 60)
         s = time_sec % 60
         self._set_status(f"マーカージャンプ: {m}:{s:04.1f}")

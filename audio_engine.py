@@ -79,6 +79,11 @@ class _TrackStreamer:
         self._pos = 0                      # 現在の再生位置（サンプル数）
         self._lock = threading.Lock()
 
+        # Phase 22: ループ再生状態（共通タイムライン上のサンプル位置）
+        self._loop_enabled: bool = False
+        self._loop_start_sample: int = 0
+        self._loop_end_sample: int = 0  # 終端はexclusive（この位置の直前まで再生）
+
         # パラメータ（スレッドセーフに更新）
         self._gain_db: float = 0.0
         self._eq_params: EQParams = EQParams()
@@ -129,29 +134,94 @@ class _TrackStreamer:
         return self._pos / SAMPLE_RATE
 
     def is_finished(self) -> bool:
-        return self._pos >= self._n_samples
+        """再生終了かを返す。ループ有効時は終端に達しても終了しない。"""
+        with self._lock:
+            return (not self._loop_enabled) and self._pos >= self._n_samples
+
+    def set_loop(self, enabled: bool, start_sample: int = 0, end_sample: int = 0):
+        """ループ範囲を設定する。終端はexclusive。"""
+        with self._lock:
+            if enabled and end_sample > start_sample:
+                self._loop_enabled = True
+                self._loop_start_sample = max(0, start_sample)
+                self._loop_end_sample = max(self._loop_start_sample + 1, end_sample)
+                # 新しい範囲外にいる場合は、範囲先頭から再生する
+                if self._pos < self._loop_start_sample or self._pos >= self._loop_end_sample:
+                    self._pos = self._loop_start_sample
+            else:
+                self._loop_enabled = False
+                self._loop_start_sample = 0
+                self._loop_end_sample = 0
+
+    def seek(self, sample_pos: int):
+        """再生位置を設定する。ループ有効時は範囲内に丸める。"""
+        with self._lock:
+            target = max(0, sample_pos)
+            if self._loop_enabled and self._loop_end_sample > self._loop_start_sample:
+                target = max(self._loop_start_sample,
+                             min(target, self._loop_end_sample - 1))
+            else:
+                target = min(target, self._n_samples)
+            self._pos = target
+
+    def _read_loop_chunk_locked(self) -> np.ndarray:
+        """ループ範囲をまたいでも常に1チャンク返す（lock取得済み）。"""
+        parts = []
+        remaining = CHUNK_SAMPLES
+        # ループが極端に短い場合も安全に複数周回できるようにする
+        while remaining > 0:
+            if self._pos >= self._loop_end_sample:
+                self._pos = self._loop_start_sample
+                # ループ境界でフィルター・ディレイ等の状態を持ち越さない
+                self._eq_engine.reset_state()
+                self._effect_engine.reset_state()
+
+            segment_end = min(self._pos + remaining, self._loop_end_sample)
+            segment_len = max(0, segment_end - self._pos)
+            if segment_len == 0:
+                self._pos = self._loop_start_sample
+                continue
+
+            if self._pos < self._n_samples:
+                audio_end = min(segment_end, self._n_samples)
+                audio = self._pcm[self._pos:audio_end].copy()
+                if len(audio) < segment_len:
+                    silence = np.zeros((segment_len - len(audio), 2), dtype=np.float32)
+                    audio = np.concatenate([audio, silence], axis=0)
+            else:
+                # 短いトラックは共通ループ終端まで無音を出力して同期を維持する
+                audio = np.zeros((segment_len, 2), dtype=np.float32)
+
+            parts.append(audio)
+            self._pos = segment_end
+            remaining -= segment_len
+
+        return np.concatenate(parts, axis=0)
 
     # --- チャンク生成（チャンク生成スレッドから呼ばれる） ---
 
     def next_chunk(self) -> Optional[np.ndarray]:
         """
         次のチャンク（CHUNK_SAMPLES サンプル）を生成して返す。
-        再生終了時は None を返す。
+        通常再生では終了時にNone、ループ再生では範囲をまたいで連続チャンクを返す。
         返り値は shape (CHUNK_SAMPLES, 2) dtype float32。
         """
         with self._lock:
-            if self._pos >= self._n_samples:
-                return None
+            if self._loop_enabled and self._loop_end_sample > self._loop_start_sample:
+                chunk = self._read_loop_chunk_locked()
+            else:
+                if self._pos >= self._n_samples:
+                    return None
 
-            # PCMスライス
-            end = min(self._pos + CHUNK_SAMPLES, self._n_samples)
-            chunk = self._pcm[self._pos:end].copy()
-            self._pos = end
+                # PCMスライス
+                end = min(self._pos + CHUNK_SAMPLES, self._n_samples)
+                chunk = self._pcm[self._pos:end].copy()
+                self._pos = end
 
-            # 末尾パディング（最終チャンクが短い場合）
-            if len(chunk) < CHUNK_SAMPLES:
-                pad = np.zeros((CHUNK_SAMPLES - len(chunk), 2), dtype=np.float32)
-                chunk = np.concatenate([chunk, pad], axis=0)
+                # 末尾パディング（最終チャンクが短い場合）
+                if len(chunk) < CHUNK_SAMPLES:
+                    pad = np.zeros((CHUNK_SAMPLES - len(chunk), 2), dtype=np.float32)
+                    chunk = np.concatenate([chunk, pad], axis=0)
 
             # ゲイン適用
             if abs(self._gain_db) > 0.01:
@@ -212,6 +282,12 @@ class AudioEngine:
         self._paused = False   # 一時停止中フラグ
         self._tracks_snapshot: List[TrackModel] = []
         self._master_volume: float = 1.0
+
+        # Phase 22: 共通タイムラインのループ範囲（秒）
+        # end_sec はexclusive。ループ設定はSTOP後も維持する。
+        self._loop_enabled: bool = False
+        self._loop_start_sec: float = 0.0
+        self._loop_end_sec: float = 0.0
 
         # マスターGEQ
         self._master_geq_params: GEQParams = GEQParams()
@@ -376,6 +452,11 @@ class AudioEngine:
                     self._effect_enabled.get(track.track_id, False)
                 )
                 s.set_aux(self._aux_enabled.get(track.track_id, False))
+                # 既に設定済みのループ範囲があれば、ループ先頭から再生する
+                if self._loop_enabled and self._loop_end_sec > self._loop_start_sec:
+                    s.set_loop(True,
+                               int(self._loop_start_sec * SAMPLE_RATE),
+                               int(self._loop_end_sec * SAMPLE_RATE))
                 self._streamers[track.track_id] = s
                 self._channels[track.track_id] = None
 
@@ -433,6 +514,101 @@ class AudioEngine:
     def is_paused(self) -> bool:
         """一時停止中かどうかを返す。"""
         return self._paused
+
+    # ------------------------------------------------------------------
+    # Phase 22: ループ再生制御
+    # ------------------------------------------------------------------
+
+    def get_timeline_duration_sec(self) -> float:
+        """読み込み済みトラックのうち、最長の再生時間を返す。"""
+        with self._lock:
+            durations = [len(pcm) / SAMPLE_RATE for pcm in self._pcm_data.values()
+                         if pcm is not None]
+        return max(durations) if durations else 0.0
+
+    def set_loop_range(self, start_sec: float, end_sec: float, enabled: bool = True) -> bool:
+        """
+        共通タイムラインのループ範囲を設定する。
+
+        再生中は古いキューを破棄して範囲先頭から即座に再スタートする。
+        範囲が不正な場合はFalse、設定に成功した場合はTrueを返す。
+        """
+        duration = self.get_timeline_duration_sec()
+        start = max(0.0, min(float(start_sec), duration))
+        end = max(0.0, min(float(end_sec), duration))
+        # 最低1サンプル以上の範囲が必要
+        if not enabled or duration <= 0.0 or end <= start + (1.0 / SAMPLE_RATE):
+            return False
+
+        start_sample = int(start * SAMPLE_RATE)
+        end_sample = max(start_sample + 1, int(end * SAMPLE_RATE))
+        with self._lock:
+            self._loop_enabled = True
+            self._loop_start_sec = start_sample / SAMPLE_RATE
+            self._loop_end_sec = min(duration, end_sample / SAMPLE_RATE)
+            streamers = dict(self._streamers)
+            channels = dict(self._channels)
+            is_playing = self._playing
+
+        for s in streamers.values():
+            if s is not None:
+                s.set_loop(True, start_sample, end_sample)
+                # ループを有効にした瞬間はIN地点から明示的に開始する
+                s.seek(start_sample)
+
+        # 動的な範囲変更時は、既にqueueされている古い音声を破棄する
+        if is_playing:
+            for ch in channels.values():
+                if ch is not None:
+                    try:
+                        ch.stop()
+                    except Exception:
+                        pass
+        self._param_changed_event.set()
+        return True
+
+    def clear_loop_range(self):
+        """ループ設定を解除して通常再生に戻す。"""
+        with self._lock:
+            self._loop_enabled = False
+            self._loop_start_sec = 0.0
+            self._loop_end_sec = 0.0
+            streamers = dict(self._streamers)
+
+        for s in streamers.values():
+            if s is not None:
+                s.set_loop(False)
+        self._param_changed_event.set()
+
+    def is_loop_enabled(self) -> bool:
+        with self._lock:
+            return self._loop_enabled
+
+    def get_loop_range(self) -> Tuple[bool, float, float]:
+        """(有効か, 開始秒, 終了秒) を返す。"""
+        with self._lock:
+            return self._loop_enabled, self._loop_start_sec, self._loop_end_sec
+
+    def seek_all_tracks(self, pos_sec: float):
+        """
+        読み込み済み全トラックを共通位置にシークする。
+        再生中はキューをクリアし、指定位置の新しい音声を供給する。
+        """
+        with self._lock:
+            streamers = dict(self._streamers)
+            channels = dict(self._channels)
+        target = int(max(0.0, pos_sec) * SAMPLE_RATE)
+        for track_id, s in streamers.items():
+            if s is None:
+                continue
+            s.seek(target)
+            ch = channels.get(track_id)
+            if ch is not None:
+                try:
+                    ch.stop()
+                except Exception:
+                    pass
+        self._param_changed_event.set()
 
     def is_playing(self) -> bool:
         """再生中（ポーズ中を含む）かどうかを返す。"""
@@ -853,9 +1029,16 @@ class AudioEngine:
             return
         total_samples = len(pcm)
         target = int(max(0.0, min(pos_sec, total_samples / SAMPLE_RATE)) * SAMPLE_RATE)
-        with s._lock:
-            s._pos = target
-        # パラメータ変更イベントを発火してストリームループに即座反映させる
+        s.seek(target)
+        # 既にキュー済みの音声を破棄し、指定位置から再生し直す
+        with self._lock:
+            ch = self._channels.get(track_id)
+        if ch is not None:
+            try:
+                ch.stop()
+            except Exception:
+                pass
+        # パラメータ変更イベントを発火してストリームループに即座に反映
         self._param_changed_event.set()
 
     # ------------------------------------------------------------------
