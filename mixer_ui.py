@@ -2904,6 +2904,8 @@ class MasterTrackWidget(QFrame):
     # REC START / STOP ボタンシグナル
     rec_start_clicked = pyqtSignal()
     rec_stop_clicked = pyqtSignal()
+    # マスターリミッター変更通知: (enabled, ceiling_db)
+    limiterChanged = pyqtSignal(bool, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3107,6 +3109,63 @@ class MasterTrackWidget(QFrame):
 
         layout.addWidget(fx_frame)
 
+        # =============================================
+        # Phase 23: マスター・リミッター
+        # =============================================
+        limiter_frame = QFrame()
+        limiter_frame.setFrameShape(QFrame.StyledPanel)
+        limiter_frame.setStyleSheet("""
+            QFrame {
+                background-color: #101b20;
+                border: 1px solid #275464;
+                border-radius: 3px;
+            }
+        """)
+        limiter_layout = QVBoxLayout(limiter_frame)
+        limiter_layout.setContentsMargins(4, 4, 4, 4)
+        limiter_layout.setSpacing(3)
+
+        limiter_header = QHBoxLayout()
+        limiter_header.setSpacing(4)
+        limiter_lbl = QLabel("LIMITER")
+        limiter_lbl.setStyleSheet("color: #42d9e8; font-size: 9px; font-weight: bold; letter-spacing: 1px;")
+        limiter_header.addWidget(limiter_lbl)
+        limiter_header.addStretch()
+        self._limiter_on_btn = QPushButton("ON")
+        self._limiter_on_btn.setFixedSize(32, 18)
+        self._limiter_on_btn.setCheckable(True)
+        self._limiter_on_btn.setChecked(True)
+        self._limiter_on_btn.setStyleSheet(self._limiter_btn_style(True))
+        self._limiter_on_btn.clicked.connect(self._on_limiter_toggle)
+        limiter_header.addWidget(self._limiter_on_btn)
+        limiter_layout.addLayout(limiter_header)
+
+        self._limiter_combo = QComboBox()
+        self._limiter_combo.addItem("-0.1 dB", -0.1)
+        self._limiter_combo.addItem("-1.0 dB", -1.0)
+        self._limiter_combo.addItem("-3.0 dB", -3.0)
+        self._limiter_combo.addItem("-6.0 dB", -6.0)
+        self._limiter_combo.setCurrentIndex(1)
+        self._limiter_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #162d35; color: #d7faff;
+                border: 1px solid #347887; border-radius: 2px;
+                font-size: 9px; font-weight: bold; padding: 1px 4px; min-height: 18px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #162d35; color: #d7faff; selection-background-color: #275464;
+                font-size: 9px;
+            }
+        """)
+        self._limiter_combo.currentIndexChanged.connect(self._on_limiter_ceiling_changed)
+        limiter_layout.addWidget(self._limiter_combo)
+
+        self._limiter_gr_label = QLabel("GR: 0.0 dB")
+        self._limiter_gr_label.setAlignment(Qt.AlignCenter)
+        self._limiter_gr_label.setStyleSheet("color: #76c9d2; font-size: 8px; font-family: Consolas;")
+        limiter_layout.addWidget(self._limiter_gr_label)
+        layout.addWidget(limiter_frame)
+
         # VUメーターウィジェット（MASTERトラックの空白部分に配置）
         vu_frame = QFrame()
         vu_frame.setFrameShape(QFrame.StyledPanel)
@@ -3298,6 +3357,77 @@ class MasterTrackWidget(QFrame):
                 }}
                 QPushButton:hover {{ background-color: #444; color: #aaa; }}
             """
+
+    def _limiter_btn_style(self, active: bool) -> str:
+        if active:
+            return """
+                QPushButton {
+                    background-color: #12606c; color: #e8ffff;
+                    border: 1px solid #42d9e8; border-radius: 3px;
+                    font-size: 8px; font-weight: bold;
+                }
+                QPushButton:hover { background-color: #168090; }
+            """
+        return """
+            QPushButton {
+                background-color: #333; color: #888;
+                border: 1px solid #444; border-radius: 3px;
+                font-size: 8px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #444; color: #aaa; }
+        """
+
+    def _on_limiter_toggle(self):
+        enabled = self._limiter_on_btn.isChecked()
+        self._limiter_on_btn.setStyleSheet(self._limiter_btn_style(enabled))
+        self._limiter_combo.setEnabled(enabled)
+        if not enabled:
+            self._limiter_gr_label.setText("GR: BYPASS")
+        self.limiterChanged.emit(enabled, self.get_limiter_ceiling_db())
+
+    def _on_limiter_ceiling_changed(self, _index: int):
+        if self._limiter_on_btn.isChecked():
+            self.limiterChanged.emit(True, self.get_limiter_ceiling_db())
+
+    def get_limiter_enabled(self) -> bool:
+        return self._limiter_on_btn.isChecked()
+
+    def get_limiter_ceiling_db(self) -> float:
+        value = self._limiter_combo.currentData()
+        return float(value) if value is not None else -1.0
+
+    def update_limiter_reduction(self, reduction_db: float):
+        """リミッターの直近ゲインリダクションを表示する。"""
+        if not self._limiter_on_btn.isChecked():
+            self._limiter_gr_label.setText("GR: BYPASS")
+            return
+        reduction_db = max(0.0, float(reduction_db))
+        self._limiter_gr_label.setText(f"GR: -{reduction_db:.1f} dB")
+        if reduction_db >= 6.0:
+            color = "#ff8d8d"
+        elif reduction_db >= 2.0:
+            color = "#f7ce78"
+        else:
+            color = "#76c9d2"
+        self._limiter_gr_label.setStyleSheet(
+            f"color: {color}; font-size: 8px; font-family: Consolas; font-weight: bold;"
+        )
+
+    def restore_limiter_state(self, enabled: bool, ceiling_db: float):
+        """リミッターのUI状態を外部設定から復元する。"""
+        self._limiter_on_btn.blockSignals(True)
+        self._limiter_combo.blockSignals(True)
+        self._limiter_on_btn.setChecked(bool(enabled))
+        self._limiter_on_btn.setStyleSheet(self._limiter_btn_style(bool(enabled)))
+        target = min(
+            range(self._limiter_combo.count()),
+            key=lambda i: abs(float(self._limiter_combo.itemData(i)) - float(ceiling_db))
+        )
+        self._limiter_combo.setCurrentIndex(target)
+        self._limiter_combo.setEnabled(bool(enabled))
+        self._limiter_on_btn.blockSignals(False)
+        self._limiter_combo.blockSignals(False)
+        self.update_limiter_reduction(0.0)
 
     def _on_fx_toggle(self):
         enabled = self._fx_on_btn.isChecked()
@@ -3509,6 +3639,7 @@ class MixerMainWindow(QMainWindow):
         self._master_widget.volumeChanged.connect(self._on_master_volume_changed)
         self._master_widget._export_btn.clicked.connect(self._on_export)
         self._master_widget.effectChanged.connect(self._on_master_effect_changed)
+        self._master_widget.limiterChanged.connect(self._on_master_limiter_changed)
         self._master_widget.geqModeChanged.connect(self._on_geq_mode_changed)
         self._master_widget.rec_start_clicked.connect(self._on_rec_start)
         self._master_widget.rec_stop_clicked.connect(self._on_rec_stop)
@@ -3842,8 +3973,13 @@ class MixerMainWindow(QMainWindow):
 
         store = ProjectStore(project_path=path)
         master_vol = self._engine.get_master_volume()
+        limiter_enabled, limiter_ceiling_db, limiter_release_ms = self._engine.get_master_limiter_state()
         ok = store.save(self._tracks, master_volume=master_vol, current_bank=self._current_bank,
-                        markers=self._marker_manager.get_all())
+                        markers=self._marker_manager.get_all(), master_limiter={
+                            "enabled": limiter_enabled,
+                            "ceiling_db": limiter_ceiling_db,
+                            "release_ms": limiter_release_ms,
+                        })
         if ok:
             if self._current_project_path is None:
                 self._current_project_path = path
@@ -3934,6 +4070,9 @@ class MixerMainWindow(QMainWindow):
                     peak_l = peak_r = 0.0
                 self._master_widget.update_vu_meter(
                     rms_l, rms_r, peak_l, peak_r, clip_l, clip_r
+                )
+                self._master_widget.update_limiter_reduction(
+                    self._engine.get_master_limiter_reduction_db()
                 )
             except Exception:
                 pass
@@ -4257,6 +4396,12 @@ class MixerMainWindow(QMainWindow):
             cmd = MasterVolumeCommand(old_vol, volume, _apply_master_vol)
             self._history.push(cmd)
             self._update_undo_redo_buttons()
+
+    def _on_master_limiter_changed(self, enabled: bool, ceiling_db: float):
+        """Phase 23: マスター・リミッター操作を最終出力へ即時反映する。"""
+        self._engine.set_master_limiter(enabled, ceiling_db)
+        state = "ON" if enabled else "BYPASS"
+        self._set_status(f"MASTER LIMITER: {state} / Ceiling {ceiling_db:.1f} dB")
 
     def _on_master_effect_changed(self, _track_id: int, preset_name: str, enabled: bool):
         """
@@ -4735,8 +4880,13 @@ class MixerMainWindow(QMainWindow):
     def _save_to_path(self, path: str):
         store = ProjectStore(project_path=path)
         master_vol = self._engine.get_master_volume()
+        limiter_enabled, limiter_ceiling_db, limiter_release_ms = self._engine.get_master_limiter_state()
         ok = store.save(self._tracks, master_volume=master_vol, current_bank=self._current_bank,
-                        markers=self._marker_manager.get_all())
+                        markers=self._marker_manager.get_all(), master_limiter={
+                            "enabled": limiter_enabled,
+                            "ceiling_db": limiter_ceiling_db,
+                            "release_ms": limiter_release_ms,
+                        })
         if ok:
             self._current_project_path = path
             self._update_project_label(path)
@@ -4781,6 +4931,16 @@ class MixerMainWindow(QMainWindow):
         self._engine.set_master_volume(master_vol)
         if self._master_widget:
             self._master_widget.restore_state(master_vol)
+
+        # Phase 23: プロジェクトに保存されたマスター・リミッターを復元
+        limiter_state = store.get_master_limiter_state()
+        self._engine.set_master_limiter(
+            limiter_state["enabled"], limiter_state["ceiling_db"], limiter_state["release_ms"]
+        )
+        if self._master_widget:
+            self._master_widget.restore_limiter_state(
+                limiter_state["enabled"], limiter_state["ceiling_db"]
+            )
 
         # EQカーブを復元（全トラック）
         from eq_engine import EQParams

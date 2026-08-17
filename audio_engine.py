@@ -23,7 +23,7 @@ import numpy as np
 
 from track_model import TrackModel
 from eq_engine import EQEngine, EQParams
-from effect_engine import EffectEngine, EFFECT_PRESETS
+from effect_engine import EffectEngine, EFFECT_PRESETS, MasterLimiter
 from geq_engine import GEQEngine, GEQParams
 import mic_engine
 from spectrum_engine import SpectrumManager
@@ -274,14 +274,23 @@ class AudioEngine:
         self._effect_enabled: Dict[int, bool] = {}
         self._aux_enabled: Dict[int, bool] = {}  # AUX ON/OFFフラグ
 
-        # pygame チャンネル
+        # pygame チャンネル（ファイル再生はマスター合成チャンネル1本を共有する）
         self._channels: Dict[int, Optional[object]] = {}
+        self._master_channel: Optional[object] = None
 
         # 再生状態
         self._playing = False
         self._paused = False   # 一時停止中フラグ
         self._tracks_snapshot: List[TrackModel] = []
         self._master_volume: float = 1.0
+
+        # Phase 23: マスター・リミッター（最終ステレオ出力へ適用）
+        self._master_limiter_enabled: bool = True
+        self._master_limiter_ceiling_db: float = -1.0
+        self._master_limiter_release_ms: float = 120.0
+        self._master_limiter = MasterLimiter(SAMPLE_RATE, self._master_limiter_release_ms)
+        self._master_limiter_reduction_db: float = 0.0
+        self._master_limiter_lock = threading.Lock()
 
         # Phase 22: 共通タイムラインのループ範囲（秒）
         # end_sec はexclusive。ループ設定はSTOP後も維持する。
@@ -463,9 +472,9 @@ class AudioEngine:
         self._playing = True
         self._stop_event.clear()
         self._stream_thread = threading.Thread(
-            target=self._stream_loop,
+            target=self._master_mix_loop,
             daemon=True,
-            name="AudioStreamLoop"
+            name="MasterMixStreamLoop"
         )
         self._stream_thread.start()
 
@@ -485,8 +494,12 @@ class AudioEngine:
         with self._lock:
             self._channels = {k: None for k in self._channels}
             self._streamers = {}
+            self._master_channel = None
         self._playing = False
         self._paused = False
+        with self._master_limiter_lock:
+            self._master_limiter.reset_state()
+            self._master_limiter_reduction_db = 0.0
 
     def pause(self):
         """再生を一時停止する。再生中のみ有効。"""
@@ -714,6 +727,144 @@ class AudioEngine:
         self._playing = False
 
     # ------------------------------------------------------------------
+    # Phase 23: 実マスター合成ストリーム
+    # ------------------------------------------------------------------
+
+    def _apply_track_mix_params(self, chunk: np.ndarray, track: TrackModel,
+                                any_solo: bool) -> np.ndarray:
+        """トラック単位の音量・PAN・MUTE/SOLOを適用し、マスター合成用PCMを返す。"""
+        out = chunk.copy()
+        if track.is_audible(any_solo):
+            left_gain, right_gain = self._calc_pan_volumes(track.volume, track.pan)
+            out[:, 0] *= left_gain
+            out[:, 1] *= right_gain
+        else:
+            out.fill(0.0)
+        return out.astype(np.float32)
+
+    def _finalize_master_chunk(self, mix: np.ndarray) -> object:
+        """合成済みステレオPCMへMASTER VOL、GEQ、リミッター、計測・録音を適用する。"""
+        out = mix.astype(np.float32, copy=True) * self._master_volume
+
+        with self._master_geq_lock:
+            geq_params = self._master_geq_params
+            geq_engine = self._master_geq_engine
+        if not geq_params.is_flat():
+            out = geq_engine.apply_vectorized(out)
+
+        pre_limit_peak = float(np.max(np.abs(out))) if out.size else 0.0
+        with self._master_limiter_lock:
+            limiter_enabled = self._master_limiter_enabled
+            ceiling_db = self._master_limiter_ceiling_db
+            if limiter_enabled:
+                out, reduction_db = self._master_limiter.process(out, ceiling_db)
+            else:
+                reduction_db = 0.0
+                self._master_limiter.reset_state()
+            self._master_limiter_reduction_db = reduction_db
+
+        # リミッターOFF時も、16bit PCM変換を壊さないための最終安全クリップを行う。
+        out = np.clip(out, -1.0, 1.0).astype(np.float32)
+
+        with self._rec_lock:
+            if self._rec_active:
+                self._rec_buffer.append(out.copy())
+
+        try:
+            rms_l = float(np.sqrt(np.mean(out[:, 0] ** 2)))
+            rms_r = float(np.sqrt(np.mean(out[:, 1] ** 2)))
+            peak_l = float(np.max(np.abs(out[:, 0])))
+            peak_r = float(np.max(np.abs(out[:, 1])))
+            with self._vu_lock:
+                self._vu_rms_l = rms_l
+                self._vu_rms_r = rms_r
+                self._vu_peak_l = max(self._vu_peak_l, peak_l)
+                self._vu_peak_r = max(self._vu_peak_r, peak_r)
+                # リミッターが保護している場合はCLIPではなくGR表示で知らせる。
+                if not limiter_enabled:
+                    if pre_limit_peak >= 0.999:
+                        self._vu_clip_l = True
+                        self._vu_clip_r = True
+        except Exception:
+            pass
+
+        i16 = (out * MAX_AMPLITUDE).astype(np.int16)
+        return self._pygame.sndarray.make_sound(i16)
+
+    def _render_master_mix_chunk(self, tracks: List[TrackModel],
+                                 streamers: Dict[int, Optional[_TrackStreamer]],
+                                 any_solo: bool) -> Tuple[Optional[np.ndarray], bool]:
+        """各トラックの次チャンクを1つずつ合成し、(PCM, データ有無)を返す。"""
+        mix = np.zeros((CHUNK_SAMPLES, 2), dtype=np.float32)
+        has_data = False
+        for track in tracks:
+            streamer = streamers.get(track.track_id)
+            if streamer is None:
+                continue
+            chunk = streamer.next_chunk()
+            if chunk is None:
+                continue
+            has_data = True
+            processed = self._apply_track_mix_params(chunk, track, any_solo)
+            mix += processed
+            try:
+                self._spectrum_manager.push_chunk(track.track_id, processed)
+            except Exception:
+                pass
+        return (mix if has_data else None), has_data
+
+    def _master_mix_loop(self):
+        """全ファイルトラックを先に合成してから、単一のマスターチャンネルへ供給する。"""
+        with self._lock:
+            tracks = list(self._tracks_snapshot)
+            streamers = dict(self._streamers)
+
+        master_channel = self._pygame.mixer.Channel(self.MAX_CHANNELS - 1)
+        with self._lock:
+            self._master_channel = master_channel
+            # 既存のトラック別シークAPIとの互換性のため、すべて同一チャンネルを参照する。
+            for track in tracks:
+                if streamers.get(track.track_id) is not None:
+                    self._channels[track.track_id] = master_channel
+
+        def queue_one() -> bool:
+            any_solo = any(track.solo for track in tracks)
+            mix, has_data = self._render_master_mix_chunk(tracks, streamers, any_solo)
+            if not has_data or mix is None:
+                return False
+            sound = self._finalize_master_chunk(mix)
+            if not master_channel.get_busy():
+                master_channel.play(sound)
+            else:
+                master_channel.queue(sound)
+            return True
+
+        # 初期キューを確保し、EQ・UI操作中も音切れしにくい余裕を持たせる。
+        queued = False
+        for _ in range(QUEUE_AHEAD):
+            queued = queue_one() or queued
+            if not queued:
+                break
+
+        while not self._stop_event.is_set() and queued:
+            if self._paused:
+                self._param_changed_event.wait(timeout=0.05)
+                self._param_changed_event.clear()
+                continue
+
+            if master_channel.get_queue() is None:
+                queued = queue_one()
+                if not queued:
+                    # 最終チャンクの再生が完了するまで短く待機してから終了する。
+                    time.sleep(CHUNK_SEC * QUEUE_AHEAD + 0.1)
+                    break
+
+            self._param_changed_event.wait(timeout=CHUNK_SEC * 0.05)
+            self._param_changed_event.clear()
+
+        self._playing = False
+
+    # ------------------------------------------------------------------
     # MICリアルタイム入力ループ（独立スレッド）
     # ------------------------------------------------------------------
 
@@ -804,60 +955,12 @@ class AudioEngine:
         float32 チャンク (CHUNK_SAMPLES, 2) を pygame.mixer.Sound に変換する。
         音量・パン・ミュート・ソロを適用する。
         """
-        if track.is_audible(any_solo):
-            left_gain, right_gain = self._calc_pan_volumes(
-                track.volume * self._master_volume, track.pan
-            )
-        else:
-            left_gain, right_gain = 0.0, 0.0
-
-        out = chunk.copy()
-        out[:, 0] *= left_gain
-        out[:, 1] *= right_gain
-
-        # マスターGEQ適用
-        with self._master_geq_lock:
-            geq_params = self._master_geq_params
-            geq_engine = self._master_geq_engine
-        if not geq_params.is_flat():
-            out = geq_engine.apply_vectorized(out)
-
-        out = np.clip(out, -1.0, 1.0)
-
-        # スペクトラムアナライザー用にFFTデータを更新
+        out = self._apply_track_mix_params(chunk, track, any_solo)
         try:
             self._spectrum_manager.push_chunk(track.track_id, out)
         except Exception:
             pass
-
-        # 録音バッファに蓄積（REC ACTIVE中のみ）
-        with self._rec_lock:
-            if self._rec_active:
-                self._rec_buffer.append(out.copy())
-
-        # リアルタイムVU/ピークメーター用にミックス済みPCMのレベルを計算
-        try:
-            rms_l = float(np.sqrt(np.mean(out[:, 0] ** 2)))
-            rms_r = float(np.sqrt(np.mean(out[:, 1] ** 2)))
-            peak_l = float(np.max(np.abs(out[:, 0])))
-            peak_r = float(np.max(np.abs(out[:, 1])))
-            with self._vu_lock:
-                self._vu_rms_l = rms_l
-                self._vu_rms_r = rms_r
-                # ピークは新値が大きいときのみ更新（ホールドはメーター側で実施）
-                if peak_l > self._vu_peak_l:
-                    self._vu_peak_l = peak_l
-                if peak_r > self._vu_peak_r:
-                    self._vu_peak_r = peak_r
-                if peak_l >= 0.999:
-                    self._vu_clip_l = True
-                if peak_r >= 0.999:
-                    self._vu_clip_r = True
-        except Exception:
-            pass
-
-        i16 = (out * 32767).astype(np.int16)
-        return self._pygame.sndarray.make_sound(i16)
+        return self._finalize_master_chunk(out)
 
     # ------------------------------------------------------------------
     # リアルタイム音量・パン更新
@@ -902,6 +1005,48 @@ class AudioEngine:
 
     def get_master_volume(self) -> float:
         return self._master_volume
+
+    # ------------------------------------------------------------------
+    # Phase 23: マスター・リミッター
+    # ------------------------------------------------------------------
+
+    def set_master_limiter(self, enabled: bool, ceiling_db: float = None,
+                           release_ms: float = None):
+        """マスター・リミッターを更新する。設定は次のマスターチャンクから反映される。"""
+        with self._master_limiter_lock:
+            self._master_limiter_enabled = bool(enabled)
+            if ceiling_db is not None:
+                self._master_limiter_ceiling_db = max(-12.0, min(-0.1, float(ceiling_db)))
+            if release_ms is not None:
+                self._master_limiter_release_ms = max(10.0, min(1000.0, float(release_ms)))
+                self._master_limiter.set_release_ms(self._master_limiter_release_ms)
+            if not self._master_limiter_enabled:
+                self._master_limiter.reset_state()
+                self._master_limiter_reduction_db = 0.0
+        self._param_changed_event.set()
+
+    def get_master_limiter_state(self) -> Tuple[bool, float, float]:
+        """(有効か、ceiling dB、release ms)を返す。"""
+        with self._master_limiter_lock:
+            return (self._master_limiter_enabled, self._master_limiter_ceiling_db,
+                    self._master_limiter_release_ms)
+
+    def get_master_limiter_reduction_db(self) -> float:
+        """直近マスターチャンクの最大ゲインリダクション量（dB）を返す。"""
+        with self._master_limiter_lock:
+            return self._master_limiter_reduction_db
+
+    def _apply_master_limiter_offline(self, pcm: np.ndarray) -> np.ndarray:
+        """EXPORT WAV用に、現在のマスター・リミッター設定を独立した状態で適用する。"""
+        with self._master_limiter_lock:
+            enabled = self._master_limiter_enabled
+            ceiling_db = self._master_limiter_ceiling_db
+            release_ms = self._master_limiter_release_ms
+        if not enabled:
+            return pcm.astype(np.float32)
+        limiter = MasterLimiter(SAMPLE_RATE, release_ms)
+        out, _ = limiter.process(pcm.astype(np.float32), ceiling_db)
+        return out
 
     def get_vu_levels(self) -> Tuple[float, float, float, float, bool, bool]:
         """
@@ -1084,6 +1229,8 @@ class AudioEngine:
             # バッファを結合（各チャンクは float32 (CHUNK_SAMPLES, 2)）
             pcm = np.concatenate(self._rec_buffer, axis=0)  # (total_samples, 2)
 
+        # RECバッファは録音時点でマスターGEQ・リミッターを通過済みの最終出力。
+        # 書き出し後に設定を変更しても、録音済みの内容は変えない。
         max_val = float(MAX_AMPLITUDE)
         mix_left  = pcm[:, 0].astype(np.float64) * max_val
         mix_right = pcm[:, 1].astype(np.float64) * max_val
@@ -1224,9 +1371,26 @@ class AudioEngine:
             mix_left  = mix_stereo[:, 0].astype(np.float64) * MAX_AMPLITUDE
             mix_right = mix_stereo[:, 1].astype(np.float64) * MAX_AMPLITUDE
 
+        # マスターGEQ後が最終ミックスバス。ここでマスター・リミッターを通す。
+        mix_stereo = np.stack(
+            [mix_left / MAX_AMPLITUDE, mix_right / MAX_AMPLITUDE], axis=1
+        ).astype(np.float32)
+        mix_stereo = self._apply_master_limiter_offline(mix_stereo)
+        mix_left = mix_stereo[:, 0].astype(np.float64) * MAX_AMPLITUDE
+        mix_right = mix_stereo[:, 1].astype(np.float64) * MAX_AMPLITUDE
+
+        # 結果は最終出力ベースで返す。リミッターOFF時だけ安全正規化にフォールバックする。
+        peak_left = float(np.max(np.abs(mix_left)))
+        peak_right = float(np.max(np.abs(mix_right)))
+        peak_level = max(peak_left, peak_right) / max_val
+        clip_left = int(np.sum(np.abs(mix_left) > max_val))
+        clip_right = int(np.sum(np.abs(mix_right) > max_val))
+        clipping_count = clip_left + clip_right
+        clipping_ratio = clipping_count / total_samples if total_samples > 0 else 0.0
+        clipping_detected = clipping_count > 0
         if clipping_detected:
             scale = max_val / max(peak_left, peak_right)
-            mix_left  *= scale
+            mix_left *= scale
             mix_right *= scale
 
         mix_left  = np.clip(mix_left,  -max_val, max_val).astype(np.int16)

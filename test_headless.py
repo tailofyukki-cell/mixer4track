@@ -10,6 +10,7 @@ import math
 import struct
 import wave
 import tempfile
+import numpy as np
 
 # SDL をダミーに設定（pygame の音声出力を無効化）
 os.environ["SDL_AUDIODRIVER"] = "dummy"
@@ -509,7 +510,7 @@ def test_gain_model():
 # 複数トラック同時再生テスト
 # ===========================================================================
 def test_multi_track_playback():
-    """複数トラックがそれぞれ別々のpygameチャンネルに割り当てられることを確認する。"""
+    """複数トラックが1本のマスター合成チャンネルで再生されることを確認する。"""
     import time
     print("=== 複数トラック同時再生テスト ===")
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -530,25 +531,80 @@ def test_multi_track_playback():
             ok = engine.load_file(i, path)
             assert ok, f"Track {i} 読み込み失敗"
 
-        engine.play_all(tracks)
-        time.sleep(0.2)  # ストリームループが走るまで待機
+        try:
+            engine.play_all(tracks)
+            time.sleep(0.2)  # マスター合成ストリームが走るまで待機
 
-        # 各トラックのチャンネルが別々のインデックスであることを確認
-        ch0 = engine._channels.get(0)
-        ch1 = engine._channels.get(1)
-        ch2 = engine._channels.get(2)
-        assert ch0 is not None, "Track 0 のチャンネルが割り当てられていない"
-        assert ch1 is not None, "Track 1 のチャンネルが割り当てられていない"
-        assert ch2 is not None, "Track 2 のチャンネルが割り当てられていない"
+            # Phase 23: すべてのファイルトラックは同じ最終ミックスチャンネルへ合成される。
+            ch0 = engine._channels.get(0)
+            ch1 = engine._channels.get(1)
+            ch2 = engine._channels.get(2)
+            assert ch0 is not None, "Track 0 のマスターチャンネルが割り当てられていない"
+            assert ch1 is not None, "Track 1 のマスターチャンネルが割り当てられていない"
+            assert ch2 is not None, "Track 2 のマスターチャンネルが割り当てられていない"
+            assert ch0 is ch1 is ch2, "トラックが単一マスター合成チャンネルを共有していない"
+            assert engine._master_channel is ch0, "マスターチャンネル参照が一致しない"
+        finally:
+            engine.stop_all()
+    print("  複数トラック・マスター合成再生: OK")
 
-        # 各チャンネルのインデックスが別々であることを確認
-        idx0 = ch0.get_sound() if hasattr(ch0, 'get_sound') else id(ch0)
-        assert ch0 is not ch1, f"Track 0とTrack 1が同じチャンネルを共有している"
-        assert ch1 is not ch2, f"Track 1とTrack 2が同じチャンネルを共有している"
-        assert ch0 is not ch2, f"Track 0とTrack 2が同じチャンネルを共有している"
 
-        engine.stop_all()
-    print("  複数トラック同時再生: OK")
+# ===========================================================================
+# Phase 23: マスター・リミッターテスト
+# ===========================================================================
+def test_master_limiter():
+    """ステレオリンク・リミッターのceiling、GR、EXPORT WAV反映を検証する。"""
+    from effect_engine import MasterLimiter
+    print("=== Phase 23: マスター・リミッター テスト ===")
+
+    ceiling_db = -1.0
+    ceiling = 10 ** (ceiling_db / 20.0)
+    limiter = MasterLimiter(sample_rate=44100, release_ms=120.0)
+    hot_pcm = np.full((2048, 2), 1.35, dtype=np.float32)
+    limited, reduction = limiter.process(hot_pcm, ceiling_db)
+    assert float(np.max(np.abs(limited))) <= ceiling + 1e-5, "ceilingを超える出力が残った"
+    assert reduction > 0.1, "過大入力でゲインリダクションが発生しない"
+    print(f"  DSP ceiling: peak={np.max(np.abs(limited)):.4f} <= {ceiling:.4f}, GR={reduction:.2f}dB - OK")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path_a = os.path.join(tmpdir, "hot_a.wav")
+        path_b = os.path.join(tmpdir, "hot_b.wav")
+        output = os.path.join(tmpdir, "limited_master.wav")
+        _make_wav(path_a, freq=440, duration=0.5, amplitude=0.90)
+        _make_wav(path_b, freq=440, duration=0.5, amplitude=0.90)
+        engine = AudioEngine(num_tracks=2)
+        if not engine._initialized:
+            print("  pygame未初期化のためexport部分skip")
+            return
+        try:
+            assert engine.load_file(0, path_a)
+            assert engine.load_file(1, path_b)
+            engine.set_master_limiter(True, ceiling_db)
+            result = engine.export_mix([
+                TrackModel(track_id=0, volume=1.0),
+                TrackModel(track_id=1, volume=1.0),
+            ], output)
+            assert result.success and os.path.isfile(output), "リミッター有効のWAV書き出しに失敗"
+            with wave.open(output, "rb") as wf:
+                data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+            output_peak = float(np.max(np.abs(data))) / 32767.0
+            assert output_peak <= ceiling + 1e-3, f"EXPORT WAVがceilingを超えた: {output_peak:.4f}"
+            print(f"  EXPORT WAV ceiling: peak={output_peak:.4f} <= {ceiling:.4f} - OK")
+        finally:
+            engine.cleanup()
+
+        project_path = os.path.join(tmpdir, "limiter_settings.m4t")
+        store = ProjectStore(project_path=project_path)
+        assert store.save([], master_limiter={
+            "enabled": False, "ceiling_db": -3.0, "release_ms": 250.0
+        }), "リミッター設定のプロジェクト保存に失敗"
+        assert store.load() is not None, "リミッター設定のプロジェクト読み込みに失敗"
+        stored_state = store.get_master_limiter_state()
+        assert stored_state["enabled"] is False
+        assert abs(stored_state["ceiling_db"] - (-3.0)) < 0.001
+        assert abs(stored_state["release_ms"] - 250.0) < 0.001
+        print("  ProjectStore limiter settings: OK")
+    print("  マスター・リミッター: OK")
 
 
 # ===========================================================================
@@ -630,6 +686,7 @@ if __name__ == "__main__":
         test_project_store_effect()
         test_gain_model()
         test_multi_track_playback()
+        test_master_limiter()
         test_loop_playback()
         test_bat_ascii()
         print("\n=== 全テスト合格 ===")

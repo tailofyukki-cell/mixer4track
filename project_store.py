@@ -8,7 +8,7 @@ Phase 20: マーカー機能追加。
 import json
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from track_model import TrackModel
 
 
@@ -107,7 +107,7 @@ class MarkerManager:
             self._next_id = 0
 
 # プロジェクトファイルのスキーマバージョン
-SCHEMA_VERSION = "8.0"
+SCHEMA_VERSION = "9.0"
 
 
 class ProjectStore:
@@ -129,9 +129,15 @@ class ProjectStore:
 
     def __init__(self, project_path: Optional[str] = None):
         self._path = project_path or os.path.join(self.DEFAULT_DIR, self.DEFAULT_FILE)
+        self._master_limiter_state = {
+            "enabled": True,
+            "ceiling_db": -1.0,
+            "release_ms": 120.0,
+        }
 
     def save(self, tracks: List[TrackModel], master_volume: float = 1.0,
-             current_bank: int = 0, markers: Optional[List] = None) -> bool:
+             current_bank: int = 0, markers: Optional[List] = None,
+             master_limiter: Optional[Dict] = None) -> bool:
         """
         トラック設定・マスター音量・現在のバンクをJSONファイルに保存する。
 
@@ -151,6 +157,7 @@ class ProjectStore:
             "current_bank": current_bank,
             "tracks": [t.to_dict() for t in tracks],
             "markers": [m.to_dict() for m in (markers or [])],
+            "master_limiter": dict(master_limiter or self._master_limiter_state),
         }
         try:
             with open(self._path, "w", encoding="utf-8") as f:
@@ -186,6 +193,12 @@ class ProjectStore:
             current_bank = int(data.get("current_bank", 0))
             current_bank = max(0, min(1, current_bank))  # 0 or 1
             marker_data = data.get("markers", [])
+            limiter_data = data.get("master_limiter", {})
+            self._master_limiter_state = {
+                "enabled": bool(limiter_data.get("enabled", True)),
+                "ceiling_db": max(-12.0, min(-0.1, float(limiter_data.get("ceiling_db", -1.0)))),
+                "release_ms": max(10.0, min(1000.0, float(limiter_data.get("release_ms", 120.0)))),
+            }
 
             print(f"[ProjectStore] 読み込み完了: {self._path} ({len(tracks)} tracks, bank={current_bank})")
             return tracks, master_volume, current_bank, marker_data
@@ -196,6 +209,10 @@ class ProjectStore:
 
     def get_path(self) -> str:
         return self._path
+
+    def get_master_limiter_state(self) -> Dict:
+        """直近に読み込んだプロジェクトのマスター・リミッター状態を返す。"""
+        return dict(self._master_limiter_state)
 
     @staticmethod
     def get_recent_projects(max_count: int = 10) -> List[str]:

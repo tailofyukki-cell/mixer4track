@@ -133,6 +133,70 @@ EFFECT_CATEGORIES = {
 
 
 # ---------------------------------------------------------------------------
+# MasterLimiter: マスター出力専用ステレオリンク・リミッター
+# ---------------------------------------------------------------------------
+
+class MasterLimiter:
+    """
+    ステレオリンクされたブリックウォール型マスター・リミッター。
+
+    立ち上がりはサンプル単位で即時に抑え、リリースだけを滑らかに戻す。
+    これにより左右の定位を崩さず、チャンク境界でもゲインリダクションを
+    保持して最終出力のデジタルクリップを防ぐ。
+    """
+
+    def __init__(self, sample_rate: int = 44100, release_ms: float = 120.0):
+        self._sr = sample_rate
+        self._release_ms = max(10.0, min(1000.0, float(release_ms)))
+        self._gain = 1.0
+        self._last_reduction_db = 0.0
+
+    def reset_state(self):
+        """再生開始・停止時にリダクション状態をリセットする。"""
+        self._gain = 1.0
+        self._last_reduction_db = 0.0
+
+    def set_release_ms(self, release_ms: float):
+        self._release_ms = max(10.0, min(1000.0, float(release_ms)))
+
+    def process(self, pcm: np.ndarray, ceiling_db: float) -> tuple[np.ndarray, float]:
+        """
+        pcmを処理し、(出力PCM, 最大ゲインリダクションdB) を返す。
+        ceilingは-12.0〜-0.1dBの範囲で安全に制限する。
+        """
+        if pcm.size == 0:
+            return pcm.astype(np.float32), 0.0
+
+        ceiling_db = max(-12.0, min(-0.1, float(ceiling_db)))
+        ceiling = float(10.0 ** (ceiling_db / 20.0))
+        peak = np.max(np.abs(pcm), axis=1).astype(np.float32)
+        required = np.minimum(1.0, ceiling / np.maximum(peak, 1e-12))
+        release_coef = math.exp(-1.0 / (self._sr * (self._release_ms / 1000.0)))
+
+        gains = np.empty(len(pcm), dtype=np.float32)
+        gain = float(self._gain)
+        min_gain = 1.0
+        for index, target in enumerate(required):
+            target_gain = float(target)
+            if target_gain < gain:
+                # アタックは即時。ピークがceilingを超えないことを優先する。
+                gain = target_gain
+            else:
+                # リリースのみ指数カーブで復帰させ、音量の揺れを抑える。
+                gain = release_coef * gain + (1.0 - release_coef) * target_gain
+            gains[index] = gain
+            min_gain = min(min_gain, gain)
+
+        self._gain = gain
+        reduction_db = -20.0 * math.log10(max(min_gain, 1e-12))
+        self._last_reduction_db = float(reduction_db)
+        return (pcm.astype(np.float32) * gains[:, None]).astype(np.float32), float(reduction_db)
+
+    def get_last_reduction_db(self) -> float:
+        return self._last_reduction_db
+
+
+# ---------------------------------------------------------------------------
 # EffectEngine: 各エフェクトのDSP処理（ステートフル・numpy vectorized）
 # ---------------------------------------------------------------------------
 
