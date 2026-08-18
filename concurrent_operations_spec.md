@@ -4,6 +4,8 @@
 **目的**: クロスフェード、EQ変化、フェーダー、PAN、FXなど複数のパラメータ変更を、再生を止めず、音切れや不連続を起こさずに扱えるようにする。  
 **状態**: 設計提案
 
+> **詳細設計**: スレッド責務、AudioParamBroker API、世代管理、Transport Epoch、ランプ、競合解決、テストケースは [multithread_event_processing_spec.md](multithread_event_processing_spec.md) を正とする。
+
 ---
 
 ## 1. 背景と問題定義
