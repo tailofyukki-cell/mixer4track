@@ -3773,9 +3773,16 @@ class MixerMainWindow(QMainWindow):
     def _build_transport(self) -> QWidget:
         transport = QWidget()
         transport.setStyleSheet(f"background-color: #111; border: 1px solid {Colors.BORDER}; border-radius: 4px;")
-        outer = QHBoxLayout(transport)
-        outer.setContentsMargins(16, 8, 16, 8)
-        outer.setSpacing(12)
+        outer = QVBoxLayout(transport)
+        outer.setContentsMargins(12, 7, 12, 7)
+        outer.setSpacing(6)
+        transport.setMinimumHeight(94)
+
+        # 上段: 再生制御とループ。横幅が不足しても下段の保存操作へ侵食しない。
+        playback_row = QHBoxLayout()
+        playback_row.setContentsMargins(0, 0, 0, 0)
+        playback_row.setSpacing(8)
+        outer.addLayout(playback_row)
 
         # Phase 21: UNDO/REDOボタン（左端）
         self._undo_btn = QPushButton("↶ UNDO")
@@ -3784,7 +3791,7 @@ class MixerMainWindow(QMainWindow):
         self._undo_btn.setStyleSheet(self._transport_btn_style("#2c3e50", "#34495e", font_size=11))
         self._undo_btn.setToolTip("UNDO (履歴なし)")
         self._undo_btn.clicked.connect(self._on_undo)
-        outer.addWidget(self._undo_btn)
+        playback_row.addWidget(self._undo_btn)
 
         self._redo_btn = QPushButton("REDO ↷")
         self._redo_btn.setFixedSize(90, 32)
@@ -3792,28 +3799,28 @@ class MixerMainWindow(QMainWindow):
         self._redo_btn.setStyleSheet(self._transport_btn_style("#2c3e50", "#34495e", font_size=11))
         self._redo_btn.setToolTip("REDO (履歴なし)")
         self._redo_btn.clicked.connect(self._on_redo)
-        outer.addWidget(self._redo_btn)
+        playback_row.addWidget(self._redo_btn)
 
-        outer.addStretch()
+        playback_row.addStretch()
 
         self._play_btn = QPushButton("▶  PLAY")
         self._play_btn.setFixedSize(120, 40)
         self._play_btn.setStyleSheet(self._transport_btn_style(Colors.BTN_PLAY, Colors.BTN_PLAY_HOV))
         self._play_btn.clicked.connect(self._on_play)
-        outer.addWidget(self._play_btn)
+        playback_row.addWidget(self._play_btn)
 
         self._pause_btn = QPushButton("⏸  PAUSE")
         self._pause_btn.setFixedSize(120, 40)
         self._pause_btn.setEnabled(False)  # 初期は無効（再生中のみ有効）
         self._pause_btn.setStyleSheet(self._transport_btn_style(Colors.BTN_PAUSE, Colors.BTN_PAUSE_HOV))
         self._pause_btn.clicked.connect(self._on_pause)
-        outer.addWidget(self._pause_btn)
+        playback_row.addWidget(self._pause_btn)
 
         self._stop_btn = QPushButton("■  STOP")
         self._stop_btn.setFixedSize(120, 40)
         self._stop_btn.setStyleSheet(self._transport_btn_style(Colors.BTN_STOP, Colors.BTN_STOP_HOV))
         self._stop_btn.clicked.connect(self._on_stop)
-        outer.addWidget(self._stop_btn)
+        playback_row.addWidget(self._stop_btn)
 
         # Phase 22: ループ再生操作
         self._loop_btn = QPushButton("↻  LOOP")
@@ -3821,14 +3828,14 @@ class MixerMainWindow(QMainWindow):
         self._loop_btn.setStyleSheet(self._transport_btn_style("#34495e", "#46637d", font_size=11))
         self._loop_btn.setToolTip("ループ再生をON/OFF（範囲未指定時は全体をループ）")
         self._loop_btn.clicked.connect(self._on_loop_toggled)
-        outer.addWidget(self._loop_btn)
+        playback_row.addWidget(self._loop_btn)
 
         self._loop_in_btn = QPushButton("IN")
         self._loop_in_btn.setFixedSize(46, 32)
         self._loop_in_btn.setStyleSheet(self._transport_btn_style("#164b56", "#1b6978", font_size=10))
         self._loop_in_btn.setToolTip("現在位置をループ開始点に設定")
         self._loop_in_btn.clicked.connect(self._on_loop_in)
-        outer.addWidget(self._loop_in_btn)
+        playback_row.addWidget(self._loop_in_btn)
 
         self._loop_out_btn = QPushButton("OUT")
         self._loop_out_btn.setFixedSize(52, 32)
@@ -3836,41 +3843,48 @@ class MixerMainWindow(QMainWindow):
         self._loop_out_btn.setStyleSheet(self._transport_btn_style("#164b56", "#1b6978", font_size=10))
         self._loop_out_btn.setToolTip("INより後の現在位置をループ終了点に設定")
         self._loop_out_btn.clicked.connect(self._on_loop_out)
-        outer.addWidget(self._loop_out_btn)
+        playback_row.addWidget(self._loop_out_btn)
 
         self._loop_all_btn = QPushButton("ALL")
         self._loop_all_btn.setFixedSize(52, 32)
         self._loop_all_btn.setStyleSheet(self._transport_btn_style("#164b56", "#1b6978", font_size=10))
         self._loop_all_btn.setToolTip("最長トラックの全体範囲をループ")
         self._loop_all_btn.clicked.connect(self._on_loop_all)
-        outer.addWidget(self._loop_all_btn)
+        playback_row.addWidget(self._loop_all_btn)
 
         self._playing_indicator = QLabel("●")
         self._playing_indicator.setStyleSheet(f"color: #333; font-size: 16px;")
-        outer.addWidget(self._playing_indicator)
+        playback_row.addWidget(self._playing_indicator)
 
-        outer.addStretch()
+        playback_row.addStretch()
+
+        # 下段: プロジェクトとマーカー。十分な余白を確保し、ボタンの重なりを防止する。
+        project_row = QHBoxLayout()
+        project_row.setContentsMargins(0, 0, 0, 0)
+        project_row.setSpacing(8)
+        outer.addLayout(project_row)
+        project_row.addStretch()
 
         # プロジェクト保存 / 読み込みボタン
         self._save_btn = QPushButton("SAVE")
         self._save_btn.setFixedSize(80, 32)
         self._save_btn.setStyleSheet(self._transport_btn_style(Colors.BTN_SAVE, Colors.BTN_SAVE_HOV, font_size=11))
         self._save_btn.clicked.connect(self._on_save_project)
-        outer.addWidget(self._save_btn)
+        project_row.addWidget(self._save_btn)
 
         self._save_as_btn = QPushButton("SAVE AS")
         self._save_as_btn.setFixedSize(90, 32)
         self._save_as_btn.setStyleSheet(self._transport_btn_style(Colors.BTN_SAVE, Colors.BTN_SAVE_HOV, font_size=10))
         self._save_as_btn.clicked.connect(self._on_save_project_as)
-        outer.addWidget(self._save_as_btn)
+        project_row.addWidget(self._save_as_btn)
 
         self._open_btn = QPushButton("OPEN")
         self._open_btn.setFixedSize(80, 32)
         self._open_btn.setStyleSheet(self._transport_btn_style(Colors.BTN_OPEN, Colors.BTN_OPEN_HOV, font_size=11))
         self._open_btn.clicked.connect(self._on_open_project)
-        outer.addWidget(self._open_btn)
+        project_row.addWidget(self._open_btn)
 
-        outer.addStretch()
+        project_row.addSpacing(20)
 
         # Phase 20: ADD MARKERボタン
         self._add_marker_btn = QPushButton("▼  ADD MARKER")
@@ -3878,7 +3892,7 @@ class MixerMainWindow(QMainWindow):
         self._add_marker_btn.setStyleSheet(self._transport_btn_style("#5d4037", "#795548", font_size=10))
         self._add_marker_btn.setToolTip("現在の再生位置にマーカーを追加")
         self._add_marker_btn.clicked.connect(self._on_add_marker)
-        outer.addWidget(self._add_marker_btn)
+        project_row.addWidget(self._add_marker_btn)
 
         # マーカーリストドロップダウン
         self._marker_combo = QComboBox()
@@ -3896,9 +3910,9 @@ class MixerMainWindow(QMainWindow):
         """)
         self._marker_combo.addItem("▼ マーカーにジャンプ")
         self._marker_combo.currentIndexChanged.connect(self._on_marker_combo_jump)
-        outer.addWidget(self._marker_combo)
+        project_row.addWidget(self._marker_combo)
 
-        outer.addStretch()
+        project_row.addStretch()
         return transport
 
     @staticmethod

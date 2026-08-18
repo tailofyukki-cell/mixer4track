@@ -1157,6 +1157,10 @@ class AudioEngine:
             return 0.0
         return len(pcm) / SAMPLE_RATE
 
+    def get_track_duration_sec(self, track_id: int) -> float:
+        """指定トラックの音声長（秒）を返す互換API。"""
+        return self.get_sound_duration(track_id)
+
     def get_track_position_sec(self, track_id: int) -> float:
         """指定トラックの現在再生位置（秒）を返す。再生中以外は 0.0。"""
         with self._lock:
