@@ -42,9 +42,9 @@ def main() -> int:
         assert window._marker_bar is not None
         assert window._marker_bar._duration_sec > 0.0
 
-    for width in (1024, 1280):
+    for width in (1280, 1440):
         transport = window._build_transport()
-        transport.resize(width, 110)
+        transport.resize(width, 60)
         transport.show()
         app.processEvents()
         buttons = (
@@ -60,6 +60,9 @@ def main() -> int:
                 assert overlap.width() == 0 or overlap.height() == 0, (
                     f"Transport controls overlap at {width}px: {button.text()} / {other.text()}"
                 )
+        assert max(button.y() for button in buttons) - min(button.y() for button in buttons) <= 6, (
+            f"Transport controls are not aligned in one row at {width}px"
+        )
         transport.close()
 
     window.close()
