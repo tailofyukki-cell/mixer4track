@@ -22,6 +22,7 @@ from typing import Optional, List, Dict, Tuple
 import numpy as np
 
 from track_model import TrackModel
+from audio_param_broker import AudioParamBroker, TrackMixParams
 from eq_engine import EQEngine, EQParams
 from effect_engine import EffectEngine, EFFECT_PRESETS, MasterLimiter
 from geq_engine import GEQEngine, GEQParams
@@ -283,6 +284,8 @@ class AudioEngine:
         self._paused = False   # 一時停止中フラグ
         self._tracks_snapshot: List[TrackModel] = []
         self._master_volume: float = 1.0
+        # Phase 24A: UIスレッドと音声スレッドの間で最新操作だけを渡す。
+        self._param_broker = AudioParamBroker(num_tracks)
 
         # Phase 23: マスター・リミッター（最終ステレオ出力へ適用）
         self._master_limiter_enabled: bool = True
@@ -469,6 +472,8 @@ class AudioEngine:
                 self._streamers[track.track_id] = s
                 self._channels[track.track_id] = None
 
+        # Phase 24A: 可変TrackModelを音声処理用の不変Snapshotとして確定する。
+        self._param_broker.reset_from_tracks(tracks, self._master_volume)
         self._playing = True
         self._stop_event.clear()
         self._stream_thread = threading.Thread(
@@ -481,6 +486,8 @@ class AudioEngine:
     def stop_all(self):
         """全トラックを停止する。"""
         self._stop_event.set()
+        # STOP前の自動操作・保留Patchを無効化する。
+        self._param_broker.begin_transport_epoch()
         if self._stream_thread is not None:
             self._stream_thread.join(timeout=2.0)
             self._stream_thread = None
@@ -730,7 +737,7 @@ class AudioEngine:
     # Phase 23: 実マスター合成ストリーム
     # ------------------------------------------------------------------
 
-    def _apply_track_mix_params(self, chunk: np.ndarray, track: TrackModel,
+    def _apply_track_mix_params(self, chunk: np.ndarray, track: TrackMixParams,
                                 any_solo: bool) -> np.ndarray:
         """トラック単位の音量・PAN・MUTE/SOLOを適用し、マスター合成用PCMを返す。"""
         out = chunk.copy()
@@ -742,9 +749,19 @@ class AudioEngine:
             out.fill(0.0)
         return out.astype(np.float32)
 
-    def _finalize_master_chunk(self, mix: np.ndarray) -> object:
+    def _finalize_master_chunk(self, mix: np.ndarray,
+                               master_volume_start: Optional[float] = None,
+                               master_volume_target: Optional[float] = None) -> object:
         """合成済みステレオPCMへMASTER VOL、GEQ、リミッター、計測・録音を適用する。"""
-        out = mix.astype(np.float32, copy=True) * self._master_volume
+        target = self._master_volume if master_volume_target is None else master_volume_target
+        start = target if master_volume_start is None else master_volume_start
+        out = mix.astype(np.float32, copy=True)
+        # Broker更新は音声スレッド内で前回実効値からチャンク内ランプを適用する。
+        if len(out) and abs(start - target) > 0.000001:
+            ramp = np.linspace(start, target, len(out), dtype=np.float32)
+            out *= ramp[:, np.newaxis]
+        else:
+            out *= target
 
         with self._master_geq_lock:
             geq_params = self._master_geq_params
@@ -793,7 +810,7 @@ class AudioEngine:
 
     def _render_master_mix_chunk(self, tracks: List[TrackModel],
                                  streamers: Dict[int, Optional[_TrackStreamer]],
-                                 any_solo: bool) -> Tuple[Optional[np.ndarray], bool]:
+                                 snapshot) -> Tuple[Optional[np.ndarray], bool]:
         """各トラックの次チャンクを1つずつ合成し、(PCM, データ有無)を返す。"""
         mix = np.zeros((CHUNK_SAMPLES, 2), dtype=np.float32)
         has_data = False
@@ -805,7 +822,8 @@ class AudioEngine:
             if chunk is None:
                 continue
             has_data = True
-            processed = self._apply_track_mix_params(chunk, track, any_solo)
+            mix_params = snapshot.track_for(track.track_id)
+            processed = self._apply_track_mix_params(chunk, mix_params, snapshot.any_solo)
             mix += processed
             try:
                 self._spectrum_manager.push_chunk(track.track_id, processed)
@@ -819,6 +837,9 @@ class AudioEngine:
             tracks = list(self._tracks_snapshot)
             streamers = dict(self._streamers)
 
+        # この変数は音声スレッドだけが更新する。UIはBroker経由で次の値を登録する。
+        render_snapshot = self._param_broker.snapshot()
+
         master_channel = self._pygame.mixer.Channel(self.MAX_CHANNELS - 1)
         with self._lock:
             self._master_channel = master_channel
@@ -828,11 +849,20 @@ class AudioEngine:
                     self._channels[track.track_id] = master_channel
 
         def queue_one() -> bool:
-            any_solo = any(track.solo for track in tracks)
-            mix, has_data = self._render_master_mix_chunk(tracks, streamers, any_solo)
+            nonlocal render_snapshot
+            previous_snapshot = render_snapshot
+            latest_snapshot = self._param_broker.take_snapshot(render_snapshot.generation)
+            if latest_snapshot is not None:
+                render_snapshot = latest_snapshot
+
+            mix, has_data = self._render_master_mix_chunk(tracks, streamers, render_snapshot)
             if not has_data or mix is None:
                 return False
-            sound = self._finalize_master_chunk(mix)
+            sound = self._finalize_master_chunk(
+                mix,
+                master_volume_start=previous_snapshot.master.volume,
+                master_volume_target=render_snapshot.master.volume,
+            )
             if not master_channel.get_busy():
                 master_channel.play(sound)
             else:
@@ -859,8 +889,10 @@ class AudioEngine:
                     time.sleep(CHUNK_SEC * QUEUE_AHEAD + 0.1)
                     break
 
-            self._param_changed_event.wait(timeout=CHUNK_SEC * 0.05)
-            self._param_changed_event.clear()
+            # Brokerはgenerationを使うためEvent.clear()由来の通知取りこぼしがない。
+            self._param_broker.wait_for_generation(
+                render_snapshot.generation, CHUNK_SEC * 0.05
+            )
 
         self._playing = False
 
@@ -977,11 +1009,21 @@ class AudioEngine:
                 if t.track_id == track.track_id:
                     self._tracks_snapshot[i] = track
                     break
+        self._param_broker.submit_track_mix(
+            track.track_id,
+            volume=track.volume,
+            pan=track.pan,
+            muted=track.muted,
+            solo=track.solo,
+        )
+        self._param_changed_event.set()
 
     def update_all_tracks(self, tracks: List[TrackModel]):
         """全トラックの状態をまとめて更新する。"""
         with self._lock:
             self._tracks_snapshot = list(tracks)
+        self._param_broker.reset_from_tracks(tracks, self._master_volume)
+        self._param_changed_event.set()
 
     # ------------------------------------------------------------------
     # マスター音量
@@ -1002,6 +1044,8 @@ class AudioEngine:
     def set_master_volume(self, volume: float):
         """マスター音量を設定する（0.0〜1.5）。"""
         self._master_volume = max(0.0, min(1.5, volume))
+        self._param_broker.submit_master_volume(self._master_volume)
+        self._param_changed_event.set()
 
     def get_master_volume(self) -> float:
         return self._master_volume

@@ -1,4 +1,4 @@
-# Mixer4Track  [Phase 23.1]
+# Mixer4Track  [Phase 24A]
 
 16トラック音楽ミキサーソフト — Phase 23: マスター・リミッター追加版
 
@@ -283,6 +283,14 @@ mixer4track/
 - **トランスポートバーを小型ボタンの一段レイアウトへ再構成**。UNDO／再生／ループ／保存／マーカー操作を一段に収め、ボタン重なりを解消。
 - 実WAV読込完了処理、1280px・1440px幅での操作ボタン非重複・横一列整列を検証するGUIスモークテストを追加。
 
+### Phase 24A: AudioParamBroker基盤
+- **`audio_param_broker.py`** を新設。UIスレッドの操作は、最新値だけを保持するスレッドセーフなBrokerへ登録する方式に変更。
+- 不変の **`AudioParamSnapshot`** と世代番号を導入。音声スレッドはチャンク境界で一度だけSnapshotを取得し、UIの可変モデルを直接読まない。
+- `Event.clear()`依存の更新検出を、`Condition` とgeneration比較へ移行し、操作通知の取りこぼしを防止。
+- 初回対象として**フェーダー、PAN、MUTE/SOLO、MASTER音量**をBroker経由へ移行。MASTER音量はチャンク内ランプで適用し、操作時の段差を抑制。
+- STOP時はTransport Epochを進め、停止前の保留Patchを無効化。
+- BrokerのPatch圧縮、手動操作優先、Transport Epoch、複数スレッド同時更新、AudioEngineミックス統合を自動テスト。
+
 ### 次期設計: 複数操作の並行実行
 - クロスフェード、EQ Morph、フェーダー、PAN、FXを安全に同時反映するための設計書を `concurrent_operations_spec.md` に追加。
 - 次の実装候補は、パラメータ更新をチャンク境界へ安全に渡す **AudioParamBroker** と、A/B/THRU割当を持つ **X-FADER**。
@@ -406,9 +414,11 @@ mixer4track/
 ## 将来拡張ロードマップ
 | Phase | 機能 |
 |-------|------|
-| Phase 23 | MIDI コントローラー対応 |
-| Phase 24 | MP3 書き出し（lameenc 統合） |
-| Phase 25 | オートメーション（フェーダー・パンの時間軸変化） |
+| Phase 24B | GAIN・EQ・FX・MASTER GEQをBrokerと音声スレッド所有へ段階移行 |
+| Phase 25 | X-FADER（A/B/THRU、Equal Power、CUT、SWAP） |
+| Phase 26 | EQ Snap A/B・EQ Morph |
+| Phase 27 | オートメーション（フェーダー・PAN・X-FADERの時間軸変化） |
+| Phase 28 | MIDI コントローラー対応 |
 
 ---
 *Created by Manus AI — 100日チャレンジ*

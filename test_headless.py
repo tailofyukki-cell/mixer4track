@@ -10,6 +10,7 @@ import math
 import struct
 import wave
 import tempfile
+import threading
 import numpy as np
 
 # SDL をダミーに設定（pygame の音声出力を無効化）
@@ -17,7 +18,8 @@ os.environ["SDL_AUDIODRIVER"] = "dummy"
 os.environ["SDL_VIDEODRIVER"] = "dummy"
 
 from track_model import TrackModel
-from audio_engine import AudioEngine
+from audio_engine import AudioEngine, CHUNK_SAMPLES, _TrackStreamer
+from audio_param_broker import AudioParamBroker, ParamBatch, ParamPatch
 from project_store import ProjectStore
 from eq_engine import EQEngine, EQParams, EQ_PRESETS
 
@@ -654,6 +656,126 @@ def test_loop_playback():
 
 
 # ===========================================================================
+# Phase 24A: AudioParamBroker テスト
+# ===========================================================================
+def test_audio_param_broker():
+    print("=== AudioParamBroker テスト ===")
+
+    broker = AudioParamBroker(num_tracks=2)
+    initial = broker.snapshot()
+    assert initial.generation == 0
+    assert initial.track_for(0).volume == 0.80
+
+    # 2パラメータを同一generationに原子的に反映する。
+    generation = broker.submit_batch(ParamBatch((
+        ParamPatch(("track", 0, "volume"), 0.25),
+        ParamPatch(("track", 0, "pan"), 0.75),
+    )))
+    updated = broker.take_snapshot(initial.generation)
+    assert updated is not None
+    assert updated.generation == generation
+    assert abs(updated.track_for(0).volume - 0.25) < 1e-6
+    assert abs(updated.track_for(0).pan - 0.75) < 1e-6
+
+    # 同一キーへの高頻度更新は最新値へ圧縮する。
+    for volume in (0.10, 0.30, 0.55, 0.90):
+        broker.submit_track_mix(0, volume=volume)
+    compressed = broker.snapshot()
+    assert abs(compressed.track_for(0).volume - 0.90) < 1e-6
+
+    # ManualはAutomationより優先し、低優先の古い意図で値が戻らない。
+    broker.submit_track_mix(1, pan=-0.80, source="automation")
+    broker.submit_track_mix(1, pan=0.20, source="manual")
+    broker.submit_track_mix(1, pan=-0.50, source="automation")
+    assert abs(broker.snapshot().track_for(1).pan - 0.20) < 1e-6
+
+    # 異なる操作を別スレッドから同時に送っても、最後の意図が両方残る。
+    start = threading.Event()
+    failures = []
+
+    def update_volume():
+        try:
+            start.wait()
+            for value in np.linspace(0.05, 0.95, 120):
+                broker.submit_track_mix(0, volume=float(value))
+        except Exception as exc:
+            failures.append(exc)
+
+    def update_pan():
+        try:
+            start.wait()
+            for value in np.linspace(-0.95, 0.75, 120):
+                broker.submit_track_mix(0, pan=float(value))
+        except Exception as exc:
+            failures.append(exc)
+
+    volume_thread = threading.Thread(target=update_volume)
+    pan_thread = threading.Thread(target=update_pan)
+    volume_thread.start()
+    pan_thread.start()
+    start.set()
+    volume_thread.join(timeout=2.0)
+    pan_thread.join(timeout=2.0)
+    assert not volume_thread.is_alive() and not pan_thread.is_alive()
+    assert not failures
+    concurrent = broker.snapshot().track_for(0)
+    assert abs(concurrent.volume - 0.95) < 1e-6
+    assert abs(concurrent.pan - 0.75) < 1e-6
+
+    # 世代番号により通知を失っても更新を検出できる。
+    last_generation = broker.current_generation()
+    broker.submit_master_volume(0.65)
+    assert broker.wait_for_generation(last_generation, 0.0)
+    assert abs(broker.snapshot().master.volume - 0.65) < 1e-6
+
+    # Transport Epoch前のPatchは破棄する。
+    stale_epoch = broker.current_transport_epoch()
+    broker.begin_transport_epoch()
+    current = broker.snapshot().track_for(0).muted
+    broker.submit_track_mix(0, muted=not current, transport_epoch=stale_epoch)
+    assert broker.snapshot().track_for(0).muted is current
+    print("  AudioParamBroker: OK")
+
+
+def test_audio_engine_broker_integration():
+    print("=== AudioEngine Broker 統合テスト ===")
+    engine = AudioEngine(num_tracks=2)
+    try:
+        tracks = [TrackModel(track_id=0, volume=0.80, pan=0.0)]
+        pcm = np.full((CHUNK_SAMPLES * 3, 2), 0.5, dtype=np.float32)
+        streamers = {0: _TrackStreamer(0, pcm, engine.SAMPLE_RATE)}
+        engine._param_broker.reset_from_tracks(tracks, 1.0)
+        initial = engine._param_broker.snapshot()
+
+        mix, has_data = engine._render_master_mix_chunk(tracks, streamers, initial)
+        assert has_data and mix is not None
+        left, right = engine._calc_pan_volumes(0.80, 0.0)
+        assert np.allclose(mix[0], [0.5 * left, 0.5 * right], atol=1e-6)
+
+        # UIモデル変更はBrokerを通り、次Snapshotから音声ミックスへ反映される。
+        tracks[0].volume = 0.25
+        tracks[0].pan = 1.0
+        engine.update_track(tracks[0], False)
+        changed = engine._param_broker.take_snapshot(initial.generation)
+        assert changed is not None
+        assert abs(changed.track_for(0).volume - 0.25) < 1e-6
+        assert abs(changed.track_for(0).pan - 1.0) < 1e-6
+
+        mix, has_data = engine._render_master_mix_chunk(tracks, streamers, changed)
+        assert has_data and mix is not None
+        left, right = engine._calc_pan_volumes(0.25, 1.0)
+        assert np.allclose(mix[0], [0.5 * left, 0.5 * right], atol=1e-6)
+
+        engine.set_master_volume(0.40)
+        master_changed = engine._param_broker.take_snapshot(changed.generation)
+        assert master_changed is not None
+        assert abs(master_changed.master.volume - 0.40) < 1e-6
+    finally:
+        engine.cleanup()
+    print("  AudioEngine Broker統合: OK")
+
+
+# ===========================================================================
 # build_windows.bat ASCII チェック
 # ===========================================================================
 def test_bat_ascii():
@@ -688,6 +810,8 @@ if __name__ == "__main__":
         test_multi_track_playback()
         test_master_limiter()
         test_loop_playback()
+        test_audio_param_broker()
+        test_audio_engine_broker_integration()
         test_bat_ascii()
         print("\n=== 全テスト合格 ===")
         sys.exit(0)

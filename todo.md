@@ -46,3 +46,12 @@
 - [x] ロック範囲、イベント圧縮、スムージング、例外時の安全動作を定義する。
 - [x] 負荷・競合・音切れ・決定性を検証するテスト仕様を定義する。
 - [x] 実装ロードマップと受入基準をレビュー用仕様書へまとめる。
+
+## Phase 24A: AudioParamBroker 実装
+
+- [x] 既存の更新API・音声スレッド・テスト構成を確認し、初回移行対象をFader／PAN／MASTERへ限定する。
+- [x] `audio_param_broker.py`を新設し、Patch、Batch、世代番号、Transport Epoch、Condition待機、スナップショットを実装する。
+- [x] `audio_engine.py`へBrokerを組み込み、チャンク開始時に最新スナップショットを取得する。
+- [x] Fader、PAN、MASTER音量のUIイベントをBroker経由に移行し、直接DSP更新を段階的に廃止する。
+- [x] Brokerの競合・圧縮・世代検出・Transport Epochを検証する単体テストを追加する。
+- [x] 既存の音声・GUI回帰テストを実行し、README・仕様・GitHub・ZIPを更新する。

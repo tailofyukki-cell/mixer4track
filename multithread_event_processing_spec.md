@@ -2,7 +2,7 @@
 
 **対象フェーズ**: Phase 24（AudioParamBroker）以降  
 **更新日**: 2026-08-19  
-**状態**: 実装レビュー待ち  
+**状態**: Phase 24A 実装済み（Fader / PAN / MUTE / SOLO / MASTER Volume）
 **前提**: 現在の `AudioEngine._master_mix_loop()`、44.1kHz、80msチャンク、`QUEUE_AHEAD=2` を維持する。
 
 ---
@@ -400,7 +400,7 @@ STOP、LOAD、BANK切替、プロジェクトOPEN、再生開始／終了は連�
 
 | フェーズ | 実装内容 | 完了条件 |
 |---|---|---|
-| Phase 24A | Broker、Snapshot、generation、単体テスト | UIがBrokerへPatchを送れ、音声スレッドが無ロックDSPでSnapshotを読める。 |
+| Phase 24A | Broker、Snapshot、generation、単体テスト | **実装済み**。UIがBrokerへPatchを送り、音声スレッドが不変Snapshotを読んでFader/PAN/MASTERを適用する。 |
 | Phase 24B | Fader/PAN/MUTE/SOLO/MASTERのランプ移行 | 既存機能の回帰なし、ドラッグは1件のUNDOに圧縮される。 |
 | Phase 25 | X-FADER | A/B/THRU、Curve、CUT、SWAP、保存・REC/WAV反映が完了する。 |
 | Phase 26 | EQ Morph | A/B保存、Morph、個別EQ競合規則、EQカーブ表示が完了する。 |
