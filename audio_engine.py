@@ -301,6 +301,12 @@ class AudioEngine:
         self._paused = False   # 一時停止中フラグ
         self._tracks_snapshot: List[TrackModel] = []
         self._master_volume: float = 1.0
+        self._master_xfade = {
+            "position": 0.5,
+            "curve": "equal_power",
+            "cut_a": False,
+            "cut_b": False,
+        }
         # Phase 24A: UIスレッドと音声スレッドの間で最新操作だけを渡す。
         self._param_broker = AudioParamBroker(num_tracks)
 
@@ -751,16 +757,42 @@ class AudioEngine:
     # ------------------------------------------------------------------
 
     def _apply_track_mix_params(self, chunk: np.ndarray, track: TrackMixParams,
-                                any_solo: bool) -> np.ndarray:
+                                any_solo: bool, xfade_start, xfade_target) -> np.ndarray:
         """トラック単位の音量・PAN・MUTE/SOLOを適用し、マスター合成用PCMを返す。"""
         out = chunk.copy()
         if track.is_audible(any_solo):
             left_gain, right_gain = self._calc_pan_volumes(track.volume, track.pan)
-            out[:, 0] *= left_gain
-            out[:, 1] *= right_gain
+            start_gain = self._get_xfade_gain(track.xfade_assign, xfade_start)
+            target_gain = self._get_xfade_gain(track.xfade_assign, xfade_target)
+            # Phase 25: position/CUT/curveの変更はチャンク内でランプし、クリックを抑える。
+            if abs(start_gain - target_gain) > 1e-7:
+                xfade_gain = np.linspace(start_gain, target_gain, len(out), dtype=np.float32)
+                out[:, 0] *= left_gain * xfade_gain
+                out[:, 1] *= right_gain * xfade_gain
+            else:
+                out[:, 0] *= left_gain * target_gain
+                out[:, 1] *= right_gain * target_gain
         else:
             out.fill(0.0)
         return out.astype(np.float32)
+
+    @staticmethod
+    def _get_xfade_gain(assign: str, xfade) -> float:
+        """A/B/THRU割当とX-FADER設定からトラックへ乗算するゲインを返す。"""
+        assign = str(assign).upper()
+        if assign == "THRU":
+            return 1.0
+        if assign == "A":
+            if xfade.cut_a:
+                return 0.0
+            return (math.cos(xfade.position * math.pi / 2.0)
+                    if xfade.curve == "equal_power" else 1.0 - xfade.position)
+        if assign == "B":
+            if xfade.cut_b:
+                return 0.0
+            return (math.sin(xfade.position * math.pi / 2.0)
+                    if xfade.curve == "equal_power" else xfade.position)
+        return 1.0
 
     def _finalize_master_chunk(self, mix: np.ndarray,
                                master_volume_start: Optional[float] = None,
@@ -863,10 +895,11 @@ class AudioEngine:
 
     def _render_master_mix_chunk(self, tracks: List[TrackModel],
                                  streamers: Dict[int, Optional[_TrackStreamer]],
-                                 snapshot) -> Tuple[Optional[np.ndarray], bool]:
+                                 snapshot, previous_xfade=None) -> Tuple[Optional[np.ndarray], bool]:
         """各トラックの次チャンクを1つずつ合成し、(PCM, データ有無)を返す。"""
         mix = np.zeros((CHUNK_SAMPLES, 2), dtype=np.float32)
         has_data = False
+        previous_xfade = previous_xfade or snapshot.master.xfade
         for track in tracks:
             streamer = streamers.get(track.track_id)
             if streamer is None:
@@ -876,7 +909,9 @@ class AudioEngine:
                 continue
             has_data = True
             mix_params = snapshot.track_for(track.track_id)
-            processed = self._apply_track_mix_params(chunk, mix_params, snapshot.any_solo)
+            processed = self._apply_track_mix_params(
+                chunk, mix_params, snapshot.any_solo, previous_xfade, snapshot.master.xfade
+            )
             mix += processed
             try:
                 self._spectrum_manager.push_chunk(track.track_id, processed)
@@ -915,7 +950,9 @@ class AudioEngine:
                     streamer.apply_dsp_params(render_snapshot.track_for(track.track_id).dsp)
             self._apply_master_dsp_snapshot(render_snapshot)
 
-            mix, has_data = self._render_master_mix_chunk(tracks, streamers, render_snapshot)
+            mix, has_data = self._render_master_mix_chunk(
+                tracks, streamers, render_snapshot, previous_snapshot.master.xfade
+            )
             if not has_data or mix is None:
                 return False
             sound = self._finalize_master_chunk(
@@ -1047,7 +1084,9 @@ class AudioEngine:
         float32 チャンク (CHUNK_SAMPLES, 2) を pygame.mixer.Sound に変換する。
         音量・パン・ミュート・ソロを適用する。
         """
-        out = self._apply_track_mix_params(chunk, track, any_solo)
+        out = self._apply_track_mix_params(
+            chunk, track, any_solo, snapshot.master.xfade, snapshot.master.xfade
+        )
         try:
             self._spectrum_manager.push_chunk(track.track_id, out)
         except Exception:
@@ -1098,6 +1137,7 @@ class AudioEngine:
             effect_enabled_by_track=self._effect_enabled,
             aux_enabled_by_track=self._aux_enabled,
             master_geq=master_geq,
+            master_xfade=self._master_xfade,
         )
 
     # ------------------------------------------------------------------
@@ -1124,6 +1164,43 @@ class AudioEngine:
 
     def get_master_volume(self) -> float:
         return self._master_volume
+
+    # ------------------------------------------------------------------
+    # Phase 25: X-FADER
+    # ------------------------------------------------------------------
+
+    def set_track_xfade_assign(self, track_id: int, assign: str):
+        """トラックのX-FADER割当をBrokerへ登録する。"""
+        assign = str(assign).upper()
+        if assign not in ("A", "B", "THRU"):
+            assign = "THRU"
+        with self._lock:
+            for track in self._tracks_snapshot:
+                if track.track_id == track_id:
+                    track.xfade_assign = assign
+                    break
+        self._param_broker.submit_track_xfade_assign(track_id, assign)
+        self._param_changed_event.set()
+
+    def set_master_xfade(self, position: float = None, curve: str = None,
+                         cut_a: bool = None, cut_b: bool = None):
+        """MASTER X-FADER状態をBrokerへ登録する。"""
+        if position is not None:
+            self._master_xfade["position"] = max(0.0, min(1.0, float(position)))
+        if curve is not None:
+            self._master_xfade["curve"] = curve if curve in ("equal_power", "linear") else "equal_power"
+        if cut_a is not None:
+            self._master_xfade["cut_a"] = bool(cut_a)
+        if cut_b is not None:
+            self._master_xfade["cut_b"] = bool(cut_b)
+        self._param_broker.submit_master_xfade(
+            position=position, curve=curve, cut_a=cut_a, cut_b=cut_b
+        )
+        self._param_changed_event.set()
+
+    def get_master_xfade_state(self) -> Dict[str, object]:
+        """現在のMASTER X-FADER状態をコピーして返す。"""
+        return dict(self._master_xfade)
 
     # ------------------------------------------------------------------
     # Phase 23: マスター・リミッター

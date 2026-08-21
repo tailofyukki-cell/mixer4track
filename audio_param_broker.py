@@ -85,6 +85,16 @@ class MasterDSPParams:
     geq: GEQSnapshot = field(default_factory=GEQSnapshot)
 
 
+@dataclass(frozen=True)
+class CrossfaderParams:
+    """X-FADERの不変状態。positionは0=A、0.5=CENTER、1=B。"""
+
+    position: float = 0.5
+    curve: str = "equal_power"
+    cut_a: bool = False
+    cut_b: bool = False
+
+
 ParamSource = Literal["default", "automation", "manual", "system", "transport"]
 ParamKey = Tuple[str, Optional[int], str]
 
@@ -107,6 +117,7 @@ class TrackMixParams:
     muted: bool = False
     solo: bool = False
     dsp: TrackDSPParams = field(default_factory=TrackDSPParams)
+    xfade_assign: str = "THRU"
 
     def is_audible(self, any_solo: bool) -> bool:
         return not self.muted and (not any_solo or self.solo)
@@ -118,6 +129,7 @@ class MasterMixParams:
 
     volume: float = 1.0
     dsp: MasterDSPParams = field(default_factory=MasterDSPParams)
+    xfade: CrossfaderParams = field(default_factory=CrossfaderParams)
 
 
 @dataclass(frozen=True)
@@ -197,7 +209,8 @@ class AudioParamBroker:
                           effect_preset_by_track: Optional[Dict[int, str]] = None,
                           effect_enabled_by_track: Optional[Dict[int, bool]] = None,
                           aux_enabled_by_track: Optional[Dict[int, bool]] = None,
-                          master_geq: Optional[object] = None) -> int:
+                          master_geq: Optional[object] = None,
+                          master_xfade: Optional[Dict[str, object]] = None) -> int:
         """再生開始時にUIモデルの現在値を一つのSnapshotとして登録する。"""
         with self._condition:
             gain_by_track = gain_by_track or {}
@@ -220,12 +233,20 @@ class AudioParamBroker:
                     volume=self._clamp_volume(track.volume),
                     pan=self._clamp_pan(track.pan),
                     muted=bool(track.muted), solo=bool(track.solo), dsp=dsp,
+                    xfade_assign=self._normalize_xfade_assign(getattr(track, "xfade_assign", "THRU")),
                 )
             master_dsp = MasterDSPParams(
                 geq=GEQSnapshot.from_params(master_geq) if master_geq is not None else GEQSnapshot()
             )
+            master_xfade = master_xfade or {}
             self._master = MasterMixParams(
-                volume=self._clamp_master_volume(master_volume), dsp=master_dsp
+                volume=self._clamp_master_volume(master_volume), dsp=master_dsp,
+                xfade=CrossfaderParams(
+                    position=self._clamp_xfade_position(float(master_xfade.get("position", 0.5))),
+                    curve=self._normalize_xfade_curve(str(master_xfade.get("curve", "equal_power"))),
+                    cut_a=bool(master_xfade.get("cut_a", False)),
+                    cut_b=bool(master_xfade.get("cut_b", False)),
+                ),
             )
             self._last_writer.clear()
             return self._commit_locked()
@@ -283,6 +304,28 @@ class AudioParamBroker:
         return self.submit_batch(ParamBatch((
             ParamPatch(("master", None, "geq"), GEQSnapshot.from_params(params), source, transport_epoch),
         )))
+
+    def submit_track_xfade_assign(self, track_id: int, assign: str, *, source: ParamSource = "manual",
+                                  transport_epoch: Optional[int] = None) -> int:
+        return self.submit_batch(ParamBatch((
+            ParamPatch(("track", track_id, "xfade_assign"), assign, source, transport_epoch),
+        )))
+
+    def submit_master_xfade(self, *, position: Optional[float] = None,
+                            curve: Optional[str] = None, cut_a: Optional[bool] = None,
+                            cut_b: Optional[bool] = None,
+                            source: ParamSource = "manual",
+                            transport_epoch: Optional[int] = None) -> int:
+        patches = []
+        if position is not None:
+            patches.append(ParamPatch(("master", None, "xfade_position"), position, source, transport_epoch))
+        if curve is not None:
+            patches.append(ParamPatch(("master", None, "xfade_curve"), curve, source, transport_epoch))
+        if cut_a is not None:
+            patches.append(ParamPatch(("master", None, "xfade_cut_a"), cut_a, source, transport_epoch))
+        if cut_b is not None:
+            patches.append(ParamPatch(("master", None, "xfade_cut_b"), cut_b, source, transport_epoch))
+        return self.submit_batch(ParamBatch(tuple(patches)))
 
     def submit_batch(self, batch: ParamBatch) -> int:
         """同じ時点に成立すべきPatch群を原子的に登録する。"""
@@ -344,12 +387,24 @@ class AudioParamBroker:
         if scope == "master":
             if field == "volume":
                 value = self._clamp_master_volume(float(patch.value))
-                updated = MasterMixParams(volume=value, dsp=self._master.dsp)
+                updated = MasterMixParams(volume=value, dsp=self._master.dsp, xfade=self._master.xfade)
             elif field == "geq":
                 updated = MasterMixParams(
                     volume=self._master.volume,
                     dsp=MasterDSPParams(geq=patch.value),
+                    xfade=self._master.xfade,
                 )
+            elif field in ("xfade_position", "xfade_curve", "xfade_cut_a", "xfade_cut_b"):
+                xfade = self._master.xfade
+                if field == "xfade_position":
+                    xfade = CrossfaderParams(self._clamp_xfade_position(float(patch.value)), xfade.curve, xfade.cut_a, xfade.cut_b)
+                elif field == "xfade_curve":
+                    xfade = CrossfaderParams(xfade.position, self._normalize_xfade_curve(str(patch.value)), xfade.cut_a, xfade.cut_b)
+                elif field == "xfade_cut_a":
+                    xfade = CrossfaderParams(xfade.position, xfade.curve, bool(patch.value), xfade.cut_b)
+                else:
+                    xfade = CrossfaderParams(xfade.position, xfade.curve, xfade.cut_a, bool(patch.value))
+                updated = MasterMixParams(volume=self._master.volume, dsp=self._master.dsp, xfade=xfade)
             else:
                 raise ValueError(f"Unsupported parameter key: {patch.key}")
             if updated == self._master:
@@ -364,36 +419,39 @@ class AudioParamBroker:
         dsp = current.dsp
         if field == "volume":
             updated = TrackMixParams(track_id, self._clamp_volume(float(patch.value)),
-                                     current.pan, current.muted, current.solo, dsp)
+                                     current.pan, current.muted, current.solo, dsp, current.xfade_assign)
         elif field == "pan":
             updated = TrackMixParams(track_id, current.volume, self._clamp_pan(float(patch.value)),
-                                     current.muted, current.solo, dsp)
+                                     current.muted, current.solo, dsp, current.xfade_assign)
         elif field == "muted":
             updated = TrackMixParams(track_id, current.volume, current.pan,
-                                     bool(patch.value), current.solo, dsp)
+                                     bool(patch.value), current.solo, dsp, current.xfade_assign)
         elif field == "solo":
             updated = TrackMixParams(track_id, current.volume, current.pan,
-                                     current.muted, bool(patch.value), dsp)
+                                     current.muted, bool(patch.value), dsp, current.xfade_assign)
         elif field == "gain_db":
             updated_dsp = TrackDSPParams(self._clamp_gain(float(patch.value)), dsp.eq,
                                          dsp.effect_preset, dsp.effect_enabled, dsp.aux_enabled)
-            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp)
+            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp, current.xfade_assign)
         elif field == "eq":
             updated_dsp = TrackDSPParams(dsp.gain_db, patch.value,
                                          dsp.effect_preset, dsp.effect_enabled, dsp.aux_enabled)
-            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp)
+            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp, current.xfade_assign)
         elif field == "effect_preset":
             updated_dsp = TrackDSPParams(dsp.gain_db, dsp.eq, str(patch.value),
                                          dsp.effect_enabled, dsp.aux_enabled)
-            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp)
+            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp, current.xfade_assign)
         elif field == "effect_enabled":
             updated_dsp = TrackDSPParams(dsp.gain_db, dsp.eq, dsp.effect_preset,
                                          bool(patch.value), dsp.aux_enabled)
-            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp)
+            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp, current.xfade_assign)
         elif field == "aux_enabled":
             updated_dsp = TrackDSPParams(dsp.gain_db, dsp.eq, dsp.effect_preset,
                                          dsp.effect_enabled, bool(patch.value))
-            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp)
+            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp, current.xfade_assign)
+        elif field == "xfade_assign":
+            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo,
+                                     dsp, self._normalize_xfade_assign(str(patch.value)))
         else:
             raise ValueError(f"Unsupported parameter key: {patch.key}")
         if updated == current:
@@ -430,3 +488,15 @@ class AudioParamBroker:
     @staticmethod
     def _clamp_pan(value: float) -> float:
         return max(-1.0, min(1.0, value))
+
+    @staticmethod
+    def _clamp_xfade_position(value: float) -> float:
+        return max(0.0, min(1.0, value))
+
+    @staticmethod
+    def _normalize_xfade_assign(value: str) -> str:
+        return value.upper() if value.upper() in ("A", "B", "THRU") else "THRU"
+
+    @staticmethod
+    def _normalize_xfade_curve(value: str) -> str:
+        return value if value in ("equal_power", "linear") else "equal_power"

@@ -2416,6 +2416,7 @@ class TrackWidget(QFrame):
     geq_band_changed    = pyqtSignal(int, float, float)  # (track_id, band_freq, gain_db)
     mic_toggled         = pyqtSignal(int)  # (track_id) - MICボタンクリック時
     aux_toggled         = pyqtSignal(int)  # (track_id) - AUXボタンクリック時
+    xfade_assign_changed = pyqtSignal(int, str)  # (track_id, A/B/THRU)
 
     # キーボードショートカット（バンク内インデックス 0～7）
     KEY_LABELS = ["A / Z", "S / X", "D / C", "F / V", "G / B", "H / N", "J / M", "K / ,"]
@@ -2568,6 +2569,32 @@ class TrackWidget(QFrame):
         ms_layout.addStretch()
         layout.addLayout(ms_layout)
 
+        # Phase 25: X-FADER割当（A / B / THRU）
+        xfade_assign_layout = QHBoxLayout()
+        xfade_assign_layout.setSpacing(3)
+        xfade_assign_label = QLabel("XF")
+        xfade_assign_label.setFixedWidth(18)
+        xfade_assign_label.setStyleSheet("color:#a99dff; font-size:8px; font-weight:bold;")
+        self._xfade_assign_combo = QComboBox()
+        self._xfade_assign_combo.addItem("THRU", "THRU")
+        self._xfade_assign_combo.addItem("A", "A")
+        self._xfade_assign_combo.addItem("B", "B")
+        self._xfade_assign_combo.setCurrentIndex(0)
+        self._xfade_assign_combo.setFixedHeight(19)
+        self._xfade_assign_combo.setToolTip("X-FADER割当: THRU / A / B")
+        self._xfade_assign_combo.setStyleSheet("""
+            QComboBox { background:#242039; color:#dcd8ff; border:1px solid #5a4f92;
+                        border-radius:2px; font-size:8px; font-weight:bold; padding:0 3px; }
+            QComboBox::drop-down { border:none; width:14px; }
+            QComboBox QAbstractItemView { background:#242039; color:#dcd8ff; font-size:8px; }
+        """)
+        self._xfade_assign_combo.currentTextChanged.connect(self._on_xfade_assign_changed)
+        xfade_assign_layout.addStretch()
+        xfade_assign_layout.addWidget(xfade_assign_label)
+        xfade_assign_layout.addWidget(self._xfade_assign_combo)
+        xfade_assign_layout.addStretch()
+        layout.addLayout(xfade_assign_layout)
+
         # フェーダー + レベルメーター
         fader_meter_layout = QHBoxLayout()
         fader_meter_layout.setSpacing(4)
@@ -2691,6 +2718,21 @@ class TrackWidget(QFrame):
             "AUX ON: このトラックにのみFXを適用中" if active
             else "AUX ON: このトラックにのみFXを適用"
         )
+
+    def _on_xfade_assign_changed(self, assign: str):
+        assign = str(assign).upper()
+        self._track.xfade_assign = assign
+        self.xfade_assign_changed.emit(self._track.track_id, assign)
+
+    def update_xfade_assign(self, assign: str):
+        assign = str(assign).upper()
+        if assign not in ("A", "B", "THRU"):
+            assign = "THRU"
+        index = self._xfade_assign_combo.findData(assign)
+        self._xfade_assign_combo.blockSignals(True)
+        self._xfade_assign_combo.setCurrentIndex(max(0, index))
+        self._xfade_assign_combo.blockSignals(False)
+        self._track.xfade_assign = assign
 
     def update_mic_state(self, active: bool, device_name: str = ""):
         """MICボタンの点灯状態を更新する。"""
@@ -2845,6 +2887,7 @@ class TrackWidget(QFrame):
         self._mute_btn.setStyleSheet(self._btn_style(track.muted, is_mute=True))
         self._solo_btn.setStyleSheet(self._btn_style(track.solo, is_mute=False))
         self.update_aux_state(track.aux_enabled)
+        self.update_xfade_assign(track.xfade_assign)
         self._file_label.setText(track.get_file_display_name())
         # ゲインを復元
         self._gain_slider.blockSignals(True)
@@ -2906,6 +2949,8 @@ class MasterTrackWidget(QFrame):
     rec_stop_clicked = pyqtSignal()
     # マスターリミッター変更通知: (enabled, ceiling_db)
     limiterChanged = pyqtSignal(bool, float)
+    # X-FADER変更通知: (position, curve, cut_a, cut_b)
+    xfadeChanged = pyqtSignal(float, str, bool, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3166,6 +3211,57 @@ class MasterTrackWidget(QFrame):
         limiter_layout.addWidget(self._limiter_gr_label)
         layout.addWidget(limiter_frame)
 
+        # =============================================
+        # Phase 25: X-FADER
+        # =============================================
+        xfade_frame = QFrame()
+        xfade_frame.setFrameShape(QFrame.StyledPanel)
+        xfade_frame.setStyleSheet("""
+            QFrame { background-color: #161521; border: 1px solid #5a4f92; border-radius: 3px; }
+        """)
+        xfade_layout = QVBoxLayout(xfade_frame)
+        xfade_layout.setContentsMargins(4, 3, 4, 3)
+        xfade_layout.setSpacing(2)
+        xfade_header = QHBoxLayout()
+        xfade_lbl = QLabel("X-FADER")
+        xfade_lbl.setStyleSheet("color: #b9adff; font-size: 8px; font-weight: bold; letter-spacing: 1px;")
+        xfade_header.addWidget(xfade_lbl)
+        xfade_header.addStretch()
+        self._xfade_curve_combo = QComboBox()
+        self._xfade_curve_combo.addItem("E.PWR", "equal_power")
+        self._xfade_curve_combo.addItem("LIN", "linear")
+        self._xfade_curve_combo.setFixedSize(48, 18)
+        self._xfade_curve_combo.setToolTip("X-FADERカーブ: Equal Power / Linear")
+        self._xfade_curve_combo.setStyleSheet("QComboBox { background:#29254a; color:#e8e5ff; border:1px solid #6d60aa; font-size:7px; padding:0 2px; }")
+        self._xfade_curve_combo.currentIndexChanged.connect(self._on_xfade_changed)
+        xfade_header.addWidget(self._xfade_curve_combo)
+        xfade_layout.addLayout(xfade_header)
+
+        self._xfade_slider = QSlider(Qt.Horizontal)
+        self._xfade_slider.setRange(0, 100)
+        self._xfade_slider.setValue(50)
+        self._xfade_slider.setFixedHeight(16)
+        self._xfade_slider.setToolTip("A ← X-FADER → B")
+        self._xfade_slider.setStyleSheet("""
+            QSlider::groove:horizontal { height:4px; background:#343052; border-radius:2px; }
+            QSlider::sub-page:horizontal { background:#8275df; border-radius:2px; }
+            QSlider::handle:horizontal { width:10px; margin:-4px 0; background:#f1edff; border:1px solid #a79bff; border-radius:5px; }
+        """)
+        self._xfade_slider.valueChanged.connect(self._on_xfade_changed)
+        xfade_layout.addWidget(self._xfade_slider)
+
+        xfade_bottom = QHBoxLayout()
+        self._xfade_cut_a_btn = QPushButton("A CUT")
+        self._xfade_cut_b_btn = QPushButton("B CUT")
+        for button in (self._xfade_cut_a_btn, self._xfade_cut_b_btn):
+            button.setFixedHeight(17)
+            button.setCheckable(True)
+            button.setStyleSheet(self._xfade_cut_style(False))
+            button.clicked.connect(self._on_xfade_changed)
+            xfade_bottom.addWidget(button)
+        xfade_layout.addLayout(xfade_bottom)
+        layout.addWidget(xfade_frame)
+
         # VUメーターウィジェット（MASTERトラックの空白部分に配置）
         vu_frame = QFrame()
         vu_frame.setFrameShape(QFrame.StyledPanel)
@@ -3203,14 +3299,14 @@ class MasterTrackWidget(QFrame):
 
         # アナログ针式VUメーター
         self._analog_vu_meter = AnalogVUMeterWidget()
-        self._analog_vu_meter.setMinimumHeight(110)
-        self._analog_vu_meter.setMaximumHeight(130)
+        self._analog_vu_meter.setMinimumHeight(90)
+        self._analog_vu_meter.setMaximumHeight(110)
         vu_layout.addWidget(self._analog_vu_meter)
 
         # セグメントVUメーター（高さを小さく調整）
         self._vu_meter = VUMeterWidget()
-        self._vu_meter.setMinimumHeight(180)
-        self._vu_meter.setMaximumHeight(220)
+        self._vu_meter.setMinimumHeight(150)
+        self._vu_meter.setMaximumHeight(180)
         vu_layout.addWidget(self._vu_meter)
 
         # dB値テキスト表示ラベル
@@ -3376,6 +3472,51 @@ class MasterTrackWidget(QFrame):
             }
             QPushButton:hover { background-color: #444; color: #aaa; }
         """
+
+    def _xfade_cut_style(self, active: bool) -> str:
+        if active:
+            return """
+                QPushButton { background:#8b2945; color:#fff1f4; border:1px solid #f07192;
+                              border-radius:2px; font-size:7px; font-weight:bold; }
+            """
+        return """
+            QPushButton { background:#29254a; color:#b9adff; border:1px solid #5a4f92;
+                          border-radius:2px; font-size:7px; font-weight:bold; }
+            QPushButton:hover { background:#3a3565; color:#fff; }
+        """
+
+    def _on_xfade_changed(self, *_args):
+        cut_a = self._xfade_cut_a_btn.isChecked()
+        cut_b = self._xfade_cut_b_btn.isChecked()
+        self._xfade_cut_a_btn.setStyleSheet(self._xfade_cut_style(cut_a))
+        self._xfade_cut_b_btn.setStyleSheet(self._xfade_cut_style(cut_b))
+        curve = self._xfade_curve_combo.currentData() or "equal_power"
+        self.xfadeChanged.emit(self._xfade_slider.value() / 100.0, curve, cut_a, cut_b)
+
+    def get_xfade_state(self) -> dict:
+        return {
+            "position": self._xfade_slider.value() / 100.0,
+            "curve": self._xfade_curve_combo.currentData() or "equal_power",
+            "cut_a": self._xfade_cut_a_btn.isChecked(),
+            "cut_b": self._xfade_cut_b_btn.isChecked(),
+        }
+
+    def restore_xfade_state(self, state: dict):
+        position = max(0.0, min(1.0, float(state.get("position", 0.5))))
+        curve = state.get("curve", "equal_power")
+        index = self._xfade_curve_combo.findData(curve)
+        widgets = (self._xfade_slider, self._xfade_curve_combo,
+                   self._xfade_cut_a_btn, self._xfade_cut_b_btn)
+        for widget in widgets:
+            widget.blockSignals(True)
+        self._xfade_slider.setValue(round(position * 100))
+        self._xfade_curve_combo.setCurrentIndex(max(0, index))
+        self._xfade_cut_a_btn.setChecked(bool(state.get("cut_a", False)))
+        self._xfade_cut_b_btn.setChecked(bool(state.get("cut_b", False)))
+        for widget in widgets:
+            widget.blockSignals(False)
+        self._xfade_cut_a_btn.setStyleSheet(self._xfade_cut_style(self._xfade_cut_a_btn.isChecked()))
+        self._xfade_cut_b_btn.setStyleSheet(self._xfade_cut_style(self._xfade_cut_b_btn.isChecked()))
 
     def _on_limiter_toggle(self):
         enabled = self._limiter_on_btn.isChecked()
@@ -3593,7 +3734,7 @@ class MixerMainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _setup_ui(self):
-        self.setWindowTitle("Mixer4Track — 16 Track Mixer  [Phase 23.1]")
+        self.setWindowTitle("Mixer4Track — 16 Track Mixer  [Phase 25]")
         self.setMinimumSize(1280, 1000)
         self.resize(1440, 1200)
 
@@ -3640,6 +3781,7 @@ class MixerMainWindow(QMainWindow):
         self._master_widget._export_btn.clicked.connect(self._on_export)
         self._master_widget.effectChanged.connect(self._on_master_effect_changed)
         self._master_widget.limiterChanged.connect(self._on_master_limiter_changed)
+        self._master_widget.xfadeChanged.connect(self._on_master_xfade_changed)
         self._master_widget.geqModeChanged.connect(self._on_geq_mode_changed)
         self._master_widget.rec_start_clicked.connect(self._on_rec_start)
         self._master_widget.rec_stop_clicked.connect(self._on_rec_stop)
@@ -3694,6 +3836,7 @@ class MixerMainWindow(QMainWindow):
             tw.eq_changed.connect(self._on_eq_changed)
             tw.mic_toggled.connect(self._on_mic_toggled)
             tw.aux_toggled.connect(self._on_aux_toggled)
+            tw.xfade_assign_changed.connect(self._on_xfade_assign_changed)
             self._track_widgets.append(tw)
             # 8本のチャンネルストリップで利用可能な横幅を均等に使う。
             layout.addWidget(tw, 1)
@@ -3711,7 +3854,7 @@ class MixerMainWindow(QMainWindow):
         title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: 18px; font-weight: bold; letter-spacing: 4px;")
         layout.addWidget(title)
 
-        phase_badge = QLabel("Phase 23.1")
+        phase_badge = QLabel("Phase 25")
         phase_badge.setStyleSheet(f"""
             color: #111; background-color: {Colors.MASTER_ACCENT};
             font-size: 10px; font-weight: bold;
@@ -3727,7 +3870,7 @@ class MixerMainWindow(QMainWindow):
 
         layout.addStretch()
 
-        subtitle = QLabel("v23.1")
+        subtitle = QLabel("v25.0")
         subtitle.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: 10px;")
         layout.addWidget(subtitle)
         return header
@@ -3968,12 +4111,13 @@ class MixerMainWindow(QMainWindow):
         store = ProjectStore(project_path=path)
         master_vol = self._engine.get_master_volume()
         limiter_enabled, limiter_ceiling_db, limiter_release_ms = self._engine.get_master_limiter_state()
+        master_xfade = self._engine.get_master_xfade_state()
         ok = store.save(self._tracks, master_volume=master_vol, current_bank=self._current_bank,
                         markers=self._marker_manager.get_all(), master_limiter={
                             "enabled": limiter_enabled,
                             "ceiling_db": limiter_ceiling_db,
                             "release_ms": limiter_release_ms,
-                        })
+                        }, master_xfade=master_xfade)
         if ok:
             if self._current_project_path is None:
                 self._current_project_path = path
@@ -4293,6 +4437,12 @@ class MixerMainWindow(QMainWindow):
         self._history.push(cmd)
         self._update_undo_redo_buttons()
 
+    def _on_xfade_assign_changed(self, track_id: int, assign: str):
+        """Phase 25: トラックのA/B/THRU割当を音声Brokerへ反映する。"""
+        self._tracks[track_id].xfade_assign = assign
+        self._engine.set_track_xfade_assign(track_id, assign)
+        self._set_status(f"Track {track_id + 1}: X-FADER {assign}")
+
     def _on_eq_changed(self, track_id: int, params):
         """
         EQノブまたはプリセット変更時のコールバック。
@@ -4396,6 +4546,12 @@ class MixerMainWindow(QMainWindow):
         self._engine.set_master_limiter(enabled, ceiling_db)
         state = "ON" if enabled else "BYPASS"
         self._set_status(f"MASTER LIMITER: {state} / Ceiling {ceiling_db:.1f} dB")
+
+    def _on_master_xfade_changed(self, position: float, curve: str, cut_a: bool, cut_b: bool):
+        """Phase 25: MASTER X-FADERをBrokerへ反映する。"""
+        self._engine.set_master_xfade(position, curve, cut_a, cut_b)
+        curve_label = curve.replace("_", " ").upper()
+        self._set_status(f"X-FADER: {position * 100:.0f}% / {curve_label}")
 
     def _on_master_effect_changed(self, _track_id: int, preset_name: str, enabled: bool):
         """
@@ -4875,12 +5031,13 @@ class MixerMainWindow(QMainWindow):
         store = ProjectStore(project_path=path)
         master_vol = self._engine.get_master_volume()
         limiter_enabled, limiter_ceiling_db, limiter_release_ms = self._engine.get_master_limiter_state()
+        master_xfade = self._engine.get_master_xfade_state()
         ok = store.save(self._tracks, master_volume=master_vol, current_bank=self._current_bank,
                         markers=self._marker_manager.get_all(), master_limiter={
                             "enabled": limiter_enabled,
                             "ceiling_db": limiter_ceiling_db,
                             "release_ms": limiter_release_ms,
-                        })
+                        }, master_xfade=master_xfade)
         if ok:
             self._current_project_path = path
             self._update_project_label(path)
@@ -4935,6 +5092,15 @@ class MixerMainWindow(QMainWindow):
             self._master_widget.restore_limiter_state(
                 limiter_state["enabled"], limiter_state["ceiling_db"]
             )
+
+        # Phase 25: MASTER X-FADERを復元
+        xfade_state = store.get_master_xfade_state()
+        self._engine.set_master_xfade(
+            xfade_state["position"], xfade_state["curve"],
+            xfade_state["cut_a"], xfade_state["cut_b"],
+        )
+        if self._master_widget:
+            self._master_widget.restore_xfade_state(xfade_state)
 
         # EQカーブを復元（全トラック）
         from eq_engine import EQParams

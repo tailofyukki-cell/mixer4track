@@ -1,6 +1,6 @@
-# Mixer4Track  [Phase 24A]
+# Mixer4Track  [Phase 25]
 
-16トラック音楽ミキサーソフト — Phase 24B: DSP Broker移行版
+16トラック音楽ミキサーソフト — Phase 25: X-FADER追加版
 
 ## 概要
 
@@ -418,10 +418,17 @@ mixer4track/
   - **`AudioEngine`** に `set_loop_range()` / `clear_loop_range()` / `get_loop_range()` / `seek_all_tracks()` / `get_timeline_duration_sec()` を追加
   - ループ状態のユニットテストと、メインウィンドウのUIスモークテストを追加
 
+### Phase 25
+- **X-FADER**（A/B/THRU割当・Equal Power / Linear・A CUT / B CUT）
+  - 各トラックに **THRU / A / B** 割当を追加。THRUは常時通過し、A/BだけがX-FADERの影響を受ける。
+  - MASTERへX-FADERパネルを追加。中央位置、カーブ、A CUT、B CUTを操作可能。
+  - 位置・カーブ・CUT状態はBroker Snapshotとしてチャンク境界で適用。A/Bのゲイン変更はチャンク内ランプで処理し、急な切替時の段差を抑制。
+  - `.m4t`にトラック割当とMASTER X-FADER状態を保存・復元。RECおよびEXPORT WAVにも同じ状態を適用。
+  - Broker、DSP、保存・復元、GUI操作の回帰テストを追加。
+
 ## 将来拡張ロードマップ
 | Phase | 機能 |
 |-------|------|
-| Phase 25 | X-FADER（A/B/THRU、Equal Power、CUT、SWAP） |
 | Phase 26 | EQ Snap A/B・EQ Morph |
 | Phase 27 | オートメーション（フェーダー・PAN・X-FADERの時間軸変化） |
 | Phase 28 | MIDI コントローラー対応 |

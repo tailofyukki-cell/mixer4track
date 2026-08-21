@@ -2,7 +2,7 @@
 
 **対象フェーズ**: Phase 24（AudioParamBroker）以降  
 **更新日**: 2026-08-19  
-**状態**: Phase 24B 実装済み（Fader / PAN / MUTE / SOLO / MASTER Volume / GAIN / Track EQ / Track FX / AUX / MASTER GEQ）
+**状態**: Phase 25 実装済み（Fader / PAN / MUTE / SOLO / MASTER Volume / GAIN / Track EQ / Track FX / AUX / MASTER GEQ / X-FADER）
 **前提**: 現在の `AudioEngine._master_mix_loop()`、44.1kHz、80msチャンク、`QUEUE_AHEAD=2` を維持する。
 
 ---

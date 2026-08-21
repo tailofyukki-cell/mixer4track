@@ -65,3 +65,28 @@
 - [x] UI操作とプロジェクト復元をBroker経由に移行する。
 - [x] 同時操作・音切れ・REC／EXPORT WAV・GUIの回帰テストを追加して実行する。
 - [x] README・仕様書・GitHub・配布ZIP・スライドを更新する。
+
+## Phase 25: X-FADER
+
+- [x] A/B/THRU割当、Equal Power／Linearカーブ、CUT、SWAPの状態をモデル・Broker・保存形式へ追加する。
+- [x] MASTERにX-FADER操作UI、各TrackにA/B/THRU割当UIを追加する。
+- [x] 音声スレッドでX-FADERゲインをチャンク内ランプ適用する。
+- [x] X-FADERのBroker・DSP・保存・GUIテストを実行し、GitHubへコミット・プッシュする。
+
+## Phase 26: EQ Snap A/B・EQ Morph
+
+- [ ] EQ Snapshot A/BとMorph位置をモデル・Broker・保存形式へ追加する。
+- [ ] Track EQ UIにA/B保存・呼出・Morph操作を追加する。
+- [ ] 音声スレッドでMorphしたEQ設定をクロスフェード適用する。
+- [ ] EQ MorphのBroker・DSP・保存・GUIテストを実行し、GitHubへコミット・プッシュする。
+
+## Phase 27: オートメーション
+
+- [ ] Fader・PAN・X-FADERのオートメーションデータ・録音・再生仕様をモデル・保存形式へ追加する。
+- [ ] オートメーション操作UIと再生制御を追加する。
+- [ ] Brokerのautomation優先度と手動操作の上書き規則を実装する。
+- [ ] オートメーションの時系列・Broker・保存・GUIテストを実行し、GitHubへコミット・プッシュする。
+
+## 最終配布
+
+- [ ] Phase 25〜27を通した全回帰、Windows配布ZIPのUTF-8・展開・SHA-256検証を行う。

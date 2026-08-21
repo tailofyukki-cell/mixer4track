@@ -32,6 +32,7 @@ class TrackModel:
     effect_enabled: bool = False          # エフェクト ON/OFF（Phase 6）
     aux_enabled: bool = False             # AUX ON/OFF: TrueのトラックのみにFXを適用（Phase 19）
     gain_db: float = 0.0                  # 入力ゲイン補正 -24dB〜+24dB（Phase 7）
+    xfade_assign: str = "THRU"            # X-FADER割当: A / B / THRU（Phase 25）
     waveform_data: Optional[list] = field(default=None, repr=False)  # 波形データ
 
     def get_display_name(self) -> str:
@@ -96,6 +97,7 @@ class TrackModel:
             "effect_enabled": self.effect_enabled,
             "gain_db":        self.gain_db,
             "aux_enabled":    self.aux_enabled,
+            "xfade_assign":   self.xfade_assign,
         }
 
     @classmethod
@@ -120,4 +122,6 @@ class TrackModel:
             effect_enabled=data.get("effect_enabled", False),
             gain_db=data.get("gain_db", 0.0),
             aux_enabled=data.get("aux_enabled", False),
+            xfade_assign=str(data.get("xfade_assign", "THRU")).upper()
+                if str(data.get("xfade_assign", "THRU")).upper() in ("A", "B", "THRU") else "THRU",
         )

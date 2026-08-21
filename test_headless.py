@@ -754,6 +754,16 @@ def test_audio_param_broker():
     assert track_dsp.effect_enabled and track_dsp.aux_enabled
     assert abs(dsp_snapshot.master.dsp.geq.to_params().get_gain(1000.0) - 4.0) < 1e-6
 
+    # Phase 25: X-FADER状態はA/B/THRU割当とともに不変Snapshotへ格納される。
+    broker.submit_track_xfade_assign(0, "A")
+    broker.submit_track_xfade_assign(1, "B")
+    broker.submit_master_xfade(position=0.0, curve="equal_power", cut_a=False, cut_b=False)
+    xfade_snapshot = broker.snapshot()
+    assert xfade_snapshot.track_for(0).xfade_assign == "A"
+    assert xfade_snapshot.track_for(1).xfade_assign == "B"
+    assert abs(xfade_snapshot.master.xfade.position - 0.0) < 1e-6
+    assert xfade_snapshot.master.xfade.curve == "equal_power"
+
     # DSP系の複数操作も、キー別の最新値へ圧縮され一つのSnapshotに収束する。
     def update_track_dsp():
         for index in range(40):
@@ -819,6 +829,26 @@ def test_audio_engine_broker_integration():
         assert master_changed is not None
         assert abs(master_changed.master.volume - 0.40) < 1e-6
 
+        # Phase 25: Aは左端、Bは右端で無音化し、THRUは常に通過する。
+        tracks[0].xfade_assign = "A"
+        engine.set_track_xfade_assign(0, "A")
+        engine.set_master_xfade(position=1.0, curve="equal_power", cut_a=False, cut_b=False)
+        xfade_changed = engine._param_broker.take_snapshot(master_changed.generation)
+        assert xfade_changed is not None
+        xfade_streamer = {0: _TrackStreamer(0, pcm, engine.SAMPLE_RATE)}
+        mix, has_data = engine._render_master_mix_chunk(tracks, xfade_streamer, xfade_changed)
+        assert has_data and mix is not None
+        assert float(np.max(np.abs(mix))) < 1e-5
+
+        engine.set_master_xfade(position=0.5, curve="linear", cut_a=False, cut_b=False)
+        linear_changed = engine._param_broker.take_snapshot(xfade_changed.generation)
+        assert linear_changed is not None
+        linear_streamer = {0: _TrackStreamer(0, pcm, engine.SAMPLE_RATE)}
+        mix, has_data = engine._render_master_mix_chunk(tracks, linear_streamer, linear_changed)
+        assert has_data and mix is not None
+        left, right = engine._calc_pan_volumes(0.25, 1.0)
+        assert np.allclose(mix[0], [0.5 * left * 0.5, 0.5 * right * 0.5], atol=1e-6)
+
         # Phase 24B: GAIN・EQ・FX・MASTER GEQは音声スレッド側のDSP適用で反映される。
         eq = EQParams(low_gain_db=4.0)
         geq = GEQParams()
@@ -852,6 +882,37 @@ def test_audio_engine_broker_integration():
     finally:
         engine.cleanup()
     print("  AudioEngine Broker統合: OK")
+
+
+# ===========================================================================
+# Phase 25: X-FADER 保存・復元テスト
+# ===========================================================================
+def test_xfade_project_store():
+    print("=== Phase 25: X-FADER保存/読み込みテスト ===")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "xfade_project.m4t")
+        tracks = [TrackModel(track_id=0), TrackModel(track_id=1)]
+        tracks[0].xfade_assign = "A"
+        tracks[1].xfade_assign = "B"
+        xfade = {
+            "position": 0.73,
+            "curve": "linear",
+            "cut_a": True,
+            "cut_b": False,
+        }
+        store = ProjectStore(project_path=path)
+        assert store.save(tracks, master_xfade=xfade)
+        loaded = store.load()
+        assert loaded is not None
+        loaded_tracks, _master, _bank, _markers = loaded
+        assert loaded_tracks[0].xfade_assign == "A"
+        assert loaded_tracks[1].xfade_assign == "B"
+        loaded_xfade = store.get_master_xfade_state()
+        assert abs(loaded_xfade["position"] - 0.73) < 1e-6
+        assert loaded_xfade["curve"] == "linear"
+        assert loaded_xfade["cut_a"] is True
+        assert loaded_xfade["cut_b"] is False
+    print("  X-FADER保存/読み込み: OK")
 
 
 # ===========================================================================
@@ -891,6 +952,7 @@ if __name__ == "__main__":
         test_loop_playback()
         test_audio_param_broker()
         test_audio_engine_broker_integration()
+        test_xfade_project_store()
         test_bat_ascii()
         print("\n=== 全テスト合格 ===")
         sys.exit(0)

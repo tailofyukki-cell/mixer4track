@@ -134,10 +134,17 @@ class ProjectStore:
             "ceiling_db": -1.0,
             "release_ms": 120.0,
         }
+        self._master_xfade_state = {
+            "position": 0.5,
+            "curve": "equal_power",
+            "cut_a": False,
+            "cut_b": False,
+        }
 
     def save(self, tracks: List[TrackModel], master_volume: float = 1.0,
              current_bank: int = 0, markers: Optional[List] = None,
-             master_limiter: Optional[Dict] = None) -> bool:
+             master_limiter: Optional[Dict] = None,
+             master_xfade: Optional[Dict] = None) -> bool:
         """
         トラック設定・マスター音量・現在のバンクをJSONファイルに保存する。
 
@@ -158,6 +165,7 @@ class ProjectStore:
             "tracks": [t.to_dict() for t in tracks],
             "markers": [m.to_dict() for m in (markers or [])],
             "master_limiter": dict(master_limiter or self._master_limiter_state),
+            "master_xfade": dict(master_xfade or self._master_xfade_state),
         }
         try:
             with open(self._path, "w", encoding="utf-8") as f:
@@ -199,6 +207,14 @@ class ProjectStore:
                 "ceiling_db": max(-12.0, min(-0.1, float(limiter_data.get("ceiling_db", -1.0)))),
                 "release_ms": max(10.0, min(1000.0, float(limiter_data.get("release_ms", 120.0)))),
             }
+            xfade_data = data.get("master_xfade", {})
+            self._master_xfade_state = {
+                "position": max(0.0, min(1.0, float(xfade_data.get("position", 0.5)))),
+                "curve": xfade_data.get("curve", "equal_power")
+                    if xfade_data.get("curve", "equal_power") in ("equal_power", "linear") else "equal_power",
+                "cut_a": bool(xfade_data.get("cut_a", False)),
+                "cut_b": bool(xfade_data.get("cut_b", False)),
+            }
 
             print(f"[ProjectStore] 読み込み完了: {self._path} ({len(tracks)} tracks, bank={current_bank})")
             return tracks, master_volume, current_bank, marker_data
@@ -213,6 +229,10 @@ class ProjectStore:
     def get_master_limiter_state(self) -> Dict:
         """直近に読み込んだプロジェクトのマスター・リミッター状態を返す。"""
         return dict(self._master_limiter_state)
+
+    def get_master_xfade_state(self) -> Dict:
+        """直近に読み込んだプロジェクトのX-FADER状態を返す。"""
+        return dict(self._master_xfade_state)
 
     @staticmethod
     def get_recent_projects(max_count: int = 10) -> List[str]:
