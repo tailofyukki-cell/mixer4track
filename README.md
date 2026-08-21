@@ -1,6 +1,6 @@
 # Mixer4Track  [Phase 26]
 
-16トラック音楽ミキサーソフト — Phase 26: EQ Snapshot / Morph追加版
+16トラック音楽ミキサーソフト — Phase 27: オートメーション追加版
 
 ## 概要
 
@@ -152,6 +152,13 @@ MASTERウィジェット内の **[REC START]** / **[REC STOP]** / **[EXPORT WAV]
 - **[SAVE AS]**: 名前を付けて保存（.m4t 形式）
 - **[OPEN]**: プロジェクトファイルを開く
 
+### 11. オートメーション（Phase 27）
+- トランスポートバーの **[AUTO REC]** をONにしてから再生すると、トラックの**フェーダー**・**PAN**、MASTERの**X-FADER位置**の操作を時刻付きで記録します。
+- 記録は **AUTO RECがON** かつ **再生中** の操作だけが対象です。停止中に動かした操作は記録されません。
+- **[AUTO PLAY]** をONにすると、記録済みの値を時刻に応じて線形補間し、音声チャンク境界で反映します。
+- **[AUTO CLR]** は確認後、全トラックとMASTERの全レーンを消去します。消去操作は元に戻せません。
+- オートメーションデータは`.m4t`プロジェクトに保存されます。プロジェクトを開いた直後はAUTO PLAYがOFFです。
+
 ## キーボードショートカット
 
 現在表示中のバンクの8トラックに対応します。
@@ -186,6 +193,7 @@ mixer4track/
 ├── main.py              # エントリーポイント
 ├── mixer_ui.py          # メインウィンドウ（PyQt5）
 ├── audio_engine.py      # 音声エンジン（再生 + 書き出し）
+├── automation_engine.py # Phase 27: フェーダー/PAN/X-FADERの記録・補間
 ├── track_model.py       # トラックデータモデル
 ├── project_store.py     # プロジェクト保存・読み込み
 ├── eq_engine.py         # 3バンドEQエンジン（Phase 5 / Phase 12改: ステートフル化）
@@ -202,7 +210,7 @@ mixer4track/
 
 ```json
 {
-  "schema_version": "6.0",
+  "schema_version": "10.0",
   "app": "Mixer4Track",
   "master_volume": 1.0,
   "current_bank": 0,
@@ -221,12 +229,18 @@ mixer4track/
       "eq_high_gain": 0.0,
       "eq_enabled": true,
       "effect_preset": "None",
-      "effect_enabled": false
+      "effect_enabled": false,
+      "automation": {
+        "volume": [{"time_sec": 0.0, "value": 0.8}],
+        "pan": [{"time_sec": 0.0, "value": 0.0}]
+      }
     },
     ...
   ]
 }
 ```
+
+`master_automation.xfade_position`にはMASTER X-FADERの時刻付きポイントを保存します。
 
 ## 技術スタック
 
@@ -297,6 +311,13 @@ mixer4track/
 - MASTER GEQは音声スレッドで新旧GEQエンジンを併走させ、20msクロスフェード後に旧インスタンスを解放。
 - `export_mix()` は開始時にBroker Snapshotを固定し、GAIN・EQ・FX/AUX・MASTER GEQ・ミックス設定が途中操作で混在しないよう改善。
 - DSP Patch圧縮、GAIN/EQ/FX/MASTER GEQのSnapshot化、2スレッド同時更新、MASTER GEQ遷移、REC/WAVを含む回帰テストを追加。
+
+### Phase 27: オートメーション
+- **`automation_engine.py`** に、近接した操作点を統合する時系列レーン、線形補間、トラック（volume/PAN）とMASTER（X-FADER）の管理を実装。
+- **[AUTO REC] / [AUTO PLAY] / [AUTO CLR]** をトランスポートバーへ追加。AUTO RECかつ再生中の手動操作だけを記録する。
+- 音声スレッドが各チャンクの生成直前に時刻を評価し、Brokerの`automation`優先度で不変Snapshotへ反映する。UIスレッドと音声スレッド間のレーンアクセスはロックで保護する。
+- `.m4t`スキーマを**10.0**へ更新し、トラックごとのレーンとMASTER X-FADERレーンを保存・復元する。
+- 補間、録音条件、Broker反映、保存・復元をヘッドレステストで、ボタン初期状態と状態連携をGUIスモークテストで検証する。
 
 ### 次期設計: 複数操作の並行実行
 - クロスフェード、EQ Morph、フェーダー、PAN、FXを安全に同時反映するための設計書を `concurrent_operations_spec.md` に追加。

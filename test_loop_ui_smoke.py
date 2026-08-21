@@ -17,6 +17,19 @@ def main():
     assert window._loop_out_btn is not None
     assert window._loop_all_btn is not None
     assert window._loop_out_btn.isEnabled() is False
+    assert window._auto_rec_btn is not None
+    assert window._auto_play_btn is not None
+    assert window._auto_clear_btn is not None
+    assert window._auto_rec_btn.isChecked() is False
+    assert window._auto_play_btn.isChecked() is False
+    window._auto_rec_btn.setChecked(True)
+    assert window._automation_recording is True
+    assert window._engine._automation.recording is True
+    window._auto_play_btn.setChecked(True)
+    assert window._automation_enabled is True
+    assert window._engine._automation.enabled is True
+    window._auto_rec_btn.setChecked(False)
+    window._auto_play_btn.setChecked(False)
     assert window._marker_bar is not None
     assert window._master_widget._limiter_on_btn.isChecked() is True
     assert abs(window._master_widget.get_limiter_ceiling_db() - (-1.0)) < 0.001
@@ -40,6 +53,12 @@ def main():
     assert abs(window._tracks[0].eq_morph_position - 0.0) < 1e-6
     window._marker_bar.set_loop_range(True, 1.0, 2.0)
     window._marker_bar.set_loop_range(False)
+    window.resize(1280, 1000)
+    window.show()
+    app.processEvents()
+    transport = window._play_btn.parentWidget()
+    assert transport is not None
+    assert window._marker_combo.geometry().right() <= transport.contentsRect().right()
     QTimer.singleShot(0, app.quit)
     app.exec_()
     window.close()

@@ -23,6 +23,7 @@ from audio_param_broker import AudioParamBroker, ParamBatch, ParamPatch
 from project_store import ProjectStore
 from eq_engine import EQEngine, EQParams, EQ_PRESETS
 from geq_engine import GEQParams
+from automation_engine import AutomationManager
 
 
 # ===========================================================================
@@ -972,6 +973,61 @@ def test_eq_snap_morph():
 
 
 # ===========================================================================
+# Phase 27: オートメーション テスト
+# ===========================================================================
+def test_automation():
+    print("=== Phase 27: オートメーションテスト ===")
+    manager = AutomationManager()
+    manager.record_track(0, "volume", 0.0, 0.20)
+    manager.record_track(0, "volume", 2.0, 0.80)
+    manager.record_track(0, "pan", 0.0, -1.0)
+    manager.record_track(0, "pan", 2.0, 1.0)
+    manager.record_master("xfade_position", 0.0, 0.10)
+    manager.record_master("xfade_position", 2.0, 0.90)
+    assert manager.values_at(1.0) == ({}, {})  # AUTO PLAYがOFFの間は適用しない
+    manager.enabled = True
+    values, master_values = manager.values_at(1.0)
+    assert abs(values[0]["volume"] - 0.50) < 1e-6
+    assert abs(values[0]["pan"] - 0.0) < 1e-6
+    assert abs(master_values["xfade_position"] - 0.50) < 1e-6
+
+    track = TrackModel(track_id=0, volume=0.20, pan=-1.0, automation=manager.get_track_data(0))
+    master_data = manager.get_master_data()
+    engine = AudioEngine(num_tracks=1)
+    try:
+        engine._param_broker.reset_from_tracks([track], 1.0)
+        initial = engine._param_broker.snapshot()
+        engine.configure_automation([track], master_data, enabled=True, recording=True)
+        engine._apply_automation_at(1.0)
+        applied = engine._param_broker.take_snapshot(initial.generation)
+        assert applied is not None
+        assert abs(applied.track_for(0).volume - 0.50) < 1e-6
+        assert abs(applied.track_for(0).pan - 0.0) < 1e-6
+        assert abs(applied.master.xfade.position - 0.50) < 1e-6
+        engine._playing = True  # 録音条件（再生中）をヘッドレスで満たす。
+        engine.record_track_automation(0, "volume", 0.65)
+        engine.record_master_automation("xfade_position", 0.35)
+        assert engine.get_automation_track_data(0)["volume"][0]["time_sec"] == 0.0
+        assert abs(engine.get_automation_track_data(0)["volume"][0]["value"] - 0.65) < 1e-6
+    finally:
+        engine.cleanup()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "automation_project.m4t")
+        store = ProjectStore(project_path=path)
+        assert store.save([track], master_automation=master_data)
+        loaded = store.load()
+        assert loaded is not None
+        loaded_track = loaded[0][0]
+        assert len(loaded_track.automation["volume"]) == 2
+        assert abs(loaded_track.automation["volume"][1]["value"] - 0.80) < 1e-6
+        loaded_master = store.get_master_automation_state()
+        assert len(loaded_master["xfade_position"]) == 2
+        assert abs(loaded_master["xfade_position"][1]["value"] - 0.90) < 1e-6
+    print("  オートメーション: OK")
+
+
+# ===========================================================================
 # build_windows.bat ASCII チェック
 # ===========================================================================
 def test_bat_ascii():
@@ -1010,6 +1066,7 @@ if __name__ == "__main__":
         test_audio_engine_broker_integration()
         test_xfade_project_store()
         test_eq_snap_morph()
+        test_automation()
         test_bat_ascii()
         print("\n=== 全テスト合格 ===")
         sys.exit(0)

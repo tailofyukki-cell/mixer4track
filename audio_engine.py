@@ -26,6 +26,7 @@ from audio_param_broker import AudioParamBroker, TrackMixParams, TrackDSPParams,
 from eq_engine import EQEngine, EQParams
 from effect_engine import EffectEngine, EFFECT_PRESETS, MasterLimiter
 from geq_engine import GEQEngine, GEQParams
+from automation_engine import AutomationManager
 import mic_engine
 from spectrum_engine import SpectrumManager
 
@@ -316,6 +317,8 @@ class AudioEngine:
         }
         # Phase 24A: UIスレッドと音声スレッドの間で最新操作だけを渡す。
         self._param_broker = AudioParamBroker(num_tracks)
+        # Phase 27: レーンの評価結果は音声スレッドからBrokerへ反映する。
+        self._automation = AutomationManager()
 
         # Phase 23: マスター・リミッター（最終ステレオ出力へ適用）
         self._master_limiter_enabled: bool = True
@@ -479,6 +482,64 @@ class AudioEngine:
         self._aux_enabled[track_id] = enabled
         self._param_broker.submit_track_dsp(track_id, aux_enabled=enabled)
         self._param_changed_event.set()
+
+    # ------------------------------------------------------------------
+    # Phase 27: オートメーション
+    # ------------------------------------------------------------------
+
+    def configure_automation(self, tracks: List[TrackModel], master_automation: Optional[Dict] = None,
+                             enabled: bool = False, recording: bool = False):
+        """保存済みレーンを設定する。再生中にも安全に差し替え可能。"""
+        for track in tracks:
+            self._automation.set_track_data(track.track_id, getattr(track, "automation", {}))
+        self._automation.set_master_data(master_automation or {})
+        self._automation.enabled = bool(enabled)
+        self._automation.recording = bool(recording)
+
+    def set_automation_enabled(self, enabled: bool):
+        self._automation.enabled = bool(enabled)
+        self._param_changed_event.set()
+
+    def set_automation_recording(self, recording: bool):
+        self._automation.recording = bool(recording)
+
+    def get_automation_master_data(self) -> Dict:
+        return self._automation.get_master_data()
+
+    def get_automation_track_data(self, track_id: int) -> Dict:
+        return self._automation.get_track_data(track_id)
+
+    def clear_automation(self):
+        """全トラックおよびMASTERのレーンを消去する。"""
+        self._automation = AutomationManager()
+        self._param_changed_event.set()
+
+    def get_timeline_position_sec(self) -> float:
+        """共通タイムラインの現在位置。短いトラックを含む場合も最大位置を採用する。"""
+        with self._lock:
+            streamers = [s for s in self._streamers.values() if s is not None]
+        positions = [s.get_pos_sec() for s in streamers]
+        return max(positions) if positions else 0.0
+
+    def record_track_automation(self, track_id: int, target: str, value: float):
+        if not self._automation.recording or not self._playing:
+            return
+        self._automation.record_track(track_id, target, self.get_timeline_position_sec(), value)
+
+    def record_master_automation(self, target: str, value: float):
+        if not self._automation.recording or not self._playing:
+            return
+        self._automation.record_master(target, self.get_timeline_position_sec(), value)
+
+    def _apply_automation_at(self, time_sec: float):
+        """補間結果をautomation優先度でBrokerへ登録する（音声スレッド専用）。"""
+        track_values, master_values = self._automation.values_at(time_sec)
+        for track_id, values in track_values.items():
+            self._param_broker.submit_track_mix(track_id, source="automation", **values)
+        if "xfade_position" in master_values:
+            self._param_broker.submit_master_xfade(
+                position=master_values["xfade_position"], source="automation"
+            )
 
     # ------------------------------------------------------------------
     # 再生制御
@@ -962,6 +1023,7 @@ class AudioEngine:
         def queue_one() -> bool:
             nonlocal render_snapshot
             previous_snapshot = render_snapshot
+            self._apply_automation_at(self.get_timeline_position_sec())
             latest_snapshot = self._param_broker.take_snapshot(render_snapshot.generation)
             if latest_snapshot is not None:
                 render_snapshot = latest_snapshot

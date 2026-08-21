@@ -107,7 +107,7 @@ class MarkerManager:
             self._next_id = 0
 
 # プロジェクトファイルのスキーマバージョン
-SCHEMA_VERSION = "9.0"
+SCHEMA_VERSION = "10.0"
 
 
 class ProjectStore:
@@ -140,11 +140,13 @@ class ProjectStore:
             "cut_a": False,
             "cut_b": False,
         }
+        self._master_automation_state = {}
 
     def save(self, tracks: List[TrackModel], master_volume: float = 1.0,
              current_bank: int = 0, markers: Optional[List] = None,
              master_limiter: Optional[Dict] = None,
-             master_xfade: Optional[Dict] = None) -> bool:
+             master_xfade: Optional[Dict] = None,
+             master_automation: Optional[Dict] = None) -> bool:
         """
         トラック設定・マスター音量・現在のバンクをJSONファイルに保存する。
 
@@ -166,6 +168,7 @@ class ProjectStore:
             "markers": [m.to_dict() for m in (markers or [])],
             "master_limiter": dict(master_limiter or self._master_limiter_state),
             "master_xfade": dict(master_xfade or self._master_xfade_state),
+            "master_automation": dict(master_automation or self._master_automation_state),
         }
         try:
             with open(self._path, "w", encoding="utf-8") as f:
@@ -215,6 +218,8 @@ class ProjectStore:
                 "cut_a": bool(xfade_data.get("cut_a", False)),
                 "cut_b": bool(xfade_data.get("cut_b", False)),
             }
+            automation_data = data.get("master_automation", {})
+            self._master_automation_state = dict(automation_data) if isinstance(automation_data, dict) else {}
 
             print(f"[ProjectStore] 読み込み完了: {self._path} ({len(tracks)} tracks, bank={current_bank})")
             return tracks, master_volume, current_bank, marker_data
@@ -233,6 +238,10 @@ class ProjectStore:
     def get_master_xfade_state(self) -> Dict:
         """直近に読み込んだプロジェクトのX-FADER状態を返す。"""
         return dict(self._master_xfade_state)
+
+    def get_master_automation_state(self) -> Dict:
+        """直近に読み込んだプロジェクトのMASTERオートメーションを返す。"""
+        return dict(self._master_automation_state)
 
     @staticmethod
     def get_recent_projects(max_count: int = 10) -> List[str]:

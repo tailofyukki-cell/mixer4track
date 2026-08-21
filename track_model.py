@@ -37,6 +37,7 @@ class TrackModel:
     eq_snap_b: Dict[str, float] = field(default_factory=dict)  # EQ Snapshot B（Phase 26）
     eq_morph_position: float = 0.0         # EQ Morph 0.0=A / 1.0=B（Phase 26）
     eq_morph_enabled: bool = False         # EQ Morph有効状態（Phase 26）
+    automation: Dict[str, list] = field(default_factory=dict)  # volume / pan automation（Phase 27）
     waveform_data: Optional[list] = field(default=None, repr=False)  # 波形データ
 
     def get_display_name(self) -> str:
@@ -106,6 +107,7 @@ class TrackModel:
             "eq_snap_b":      dict(self.eq_snap_b),
             "eq_morph_position": self.eq_morph_position,
             "eq_morph_enabled": self.eq_morph_enabled,
+            "automation":      dict(self.automation),
         }
 
     @classmethod
@@ -136,4 +138,5 @@ class TrackModel:
             eq_snap_b=dict(data.get("eq_snap_b", {})),
             eq_morph_position=max(0.0, min(1.0, float(data.get("eq_morph_position", 0.0)))),
             eq_morph_enabled=bool(data.get("eq_morph_enabled", False)),
+            automation=dict(data.get("automation", {})),
         )

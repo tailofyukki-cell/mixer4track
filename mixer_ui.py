@@ -3827,6 +3827,13 @@ class MixerMainWindow(QMainWindow):
         self._loop_out_btn = None
         self._loop_all_btn = None
 
+        # Phase 27: オートメーションの再生・録音状態
+        self._automation_enabled: bool = False
+        self._automation_recording: bool = False
+        self._auto_play_btn = None
+        self._auto_rec_btn = None
+        self._auto_clear_btn = None
+
         # GEQモード状態
         self._geq_mode: str = "off"  # 'low' / 'hi' / 'off'
         self._geq_params: GEQParams = GEQParams()
@@ -3840,7 +3847,7 @@ class MixerMainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _setup_ui(self):
-        self.setWindowTitle("Mixer4Track — 16 Track Mixer  [Phase 25]")
+        self.setWindowTitle("Mixer4Track — 16 Track Mixer  [Phase 27]")
         self.setMinimumSize(1280, 1000)
         self.resize(1440, 1200)
 
@@ -3961,7 +3968,7 @@ class MixerMainWindow(QMainWindow):
         title.setStyleSheet(f"color: {Colors.TEXT_PRIMARY}; font-size: 18px; font-weight: bold; letter-spacing: 4px;")
         layout.addWidget(title)
 
-        phase_badge = QLabel("Phase 25")
+        phase_badge = QLabel("Phase 27")
         phase_badge.setStyleSheet(f"""
             color: #111; background-color: {Colors.MASTER_ACCENT};
             font-size: 10px; font-weight: bold;
@@ -3977,7 +3984,7 @@ class MixerMainWindow(QMainWindow):
 
         layout.addStretch()
 
-        subtitle = QLabel("v25.0")
+        subtitle = QLabel("v27.0")
         subtitle.setStyleSheet(f"color: {Colors.TEXT_SECONDARY}; font-size: 10px;")
         layout.addWidget(subtitle)
         return header
@@ -4026,12 +4033,12 @@ class MixerMainWindow(QMainWindow):
         transport.setStyleSheet(f"background-color: #111; border: 1px solid {Colors.BORDER}; border-radius: 4px;")
         outer = QHBoxLayout(transport)
         outer.setContentsMargins(10, 7, 10, 7)
-        outer.setSpacing(6)
+        outer.setSpacing(3)
         transport.setFixedHeight(50)
 
         # 一段に収めるため、操作頻度に合わせて小型化したトランスポート操作。
         self._undo_btn = QPushButton("↶ UNDO")
-        self._undo_btn.setFixedSize(68, 30)
+        self._undo_btn.setFixedSize(58, 30)
         self._undo_btn.setEnabled(False)
         self._undo_btn.setStyleSheet(self._transport_btn_style("#2c3e50", "#34495e", font_size=9))
         self._undo_btn.setToolTip("UNDO (履歴なし)")
@@ -4039,49 +4046,49 @@ class MixerMainWindow(QMainWindow):
         outer.addWidget(self._undo_btn)
 
         self._redo_btn = QPushButton("REDO ↷")
-        self._redo_btn.setFixedSize(68, 30)
+        self._redo_btn.setFixedSize(58, 30)
         self._redo_btn.setEnabled(False)
         self._redo_btn.setStyleSheet(self._transport_btn_style("#2c3e50", "#34495e", font_size=9))
         self._redo_btn.setToolTip("REDO (履歴なし)")
         self._redo_btn.clicked.connect(self._on_redo)
         outer.addWidget(self._redo_btn)
-        outer.addSpacing(8)
+        outer.addSpacing(3)
 
         self._play_btn = QPushButton("▶  PLAY")
-        self._play_btn.setFixedSize(96, 34)
+        self._play_btn.setFixedSize(80, 34)
         self._play_btn.setStyleSheet(self._transport_btn_style(Colors.BTN_PLAY, Colors.BTN_PLAY_HOV, font_size=10))
         self._play_btn.clicked.connect(self._on_play)
         outer.addWidget(self._play_btn)
 
         self._pause_btn = QPushButton("⏸  PAUSE")
-        self._pause_btn.setFixedSize(96, 34)
+        self._pause_btn.setFixedSize(80, 34)
         self._pause_btn.setEnabled(False)  # 初期は無効（再生中のみ有効）
         self._pause_btn.setStyleSheet(self._transport_btn_style(Colors.BTN_PAUSE, Colors.BTN_PAUSE_HOV, font_size=10))
         self._pause_btn.clicked.connect(self._on_pause)
         outer.addWidget(self._pause_btn)
 
         self._stop_btn = QPushButton("■  STOP")
-        self._stop_btn.setFixedSize(90, 34)
+        self._stop_btn.setFixedSize(72, 34)
         self._stop_btn.setStyleSheet(self._transport_btn_style(Colors.BTN_STOP, Colors.BTN_STOP_HOV, font_size=10))
         self._stop_btn.clicked.connect(self._on_stop)
         outer.addWidget(self._stop_btn)
 
         self._loop_btn = QPushButton("↻  LOOP")
-        self._loop_btn.setFixedSize(78, 34)
+        self._loop_btn.setFixedSize(64, 34)
         self._loop_btn.setStyleSheet(self._transport_btn_style("#34495e", "#46637d", font_size=9))
         self._loop_btn.setToolTip("ループ再生をON/OFF（範囲未指定時は全体をループ）")
         self._loop_btn.clicked.connect(self._on_loop_toggled)
         outer.addWidget(self._loop_btn)
 
         self._loop_in_btn = QPushButton("IN")
-        self._loop_in_btn.setFixedSize(38, 30)
+        self._loop_in_btn.setFixedSize(34, 30)
         self._loop_in_btn.setStyleSheet(self._transport_btn_style("#164b56", "#1b6978", font_size=9))
         self._loop_in_btn.setToolTip("現在位置をループ開始点に設定")
         self._loop_in_btn.clicked.connect(self._on_loop_in)
         outer.addWidget(self._loop_in_btn)
 
         self._loop_out_btn = QPushButton("OUT")
-        self._loop_out_btn.setFixedSize(42, 30)
+        self._loop_out_btn.setFixedSize(38, 30)
         self._loop_out_btn.setEnabled(False)
         self._loop_out_btn.setStyleSheet(self._transport_btn_style("#164b56", "#1b6978", font_size=9))
         self._loop_out_btn.setToolTip("INより後の現在位置をループ終了点に設定")
@@ -4089,45 +4096,69 @@ class MixerMainWindow(QMainWindow):
         outer.addWidget(self._loop_out_btn)
 
         self._loop_all_btn = QPushButton("ALL")
-        self._loop_all_btn.setFixedSize(42, 30)
+        self._loop_all_btn.setFixedSize(38, 30)
         self._loop_all_btn.setStyleSheet(self._transport_btn_style("#164b56", "#1b6978", font_size=9))
         self._loop_all_btn.setToolTip("最長トラックの全体範囲をループ")
         self._loop_all_btn.clicked.connect(self._on_loop_all)
         outer.addWidget(self._loop_all_btn)
 
+        outer.addSpacing(2)
+        self._auto_rec_btn = QPushButton("AUTO REC")
+        self._auto_rec_btn.setCheckable(True)
+        self._auto_rec_btn.setFixedSize(68, 30)
+        self._auto_rec_btn.setToolTip("再生中のフェーダー、PAN、X-FADER操作を記録")
+        self._auto_rec_btn.setStyleSheet(self._transport_btn_style("#6a1b24", "#b3263a", font_size=8))
+        self._auto_rec_btn.toggled.connect(self._on_auto_rec_toggle)
+        outer.addWidget(self._auto_rec_btn)
+
+        self._auto_play_btn = QPushButton("AUTO PLAY")
+        self._auto_play_btn.setCheckable(True)
+        self._auto_play_btn.setFixedSize(70, 30)
+        self._auto_play_btn.setToolTip("記録済みオートメーションを再生")
+        self._auto_play_btn.setStyleSheet(self._transport_btn_style("#165b73", "#217c9b", font_size=8))
+        self._auto_play_btn.toggled.connect(self._on_auto_play_toggle)
+        outer.addWidget(self._auto_play_btn)
+
+        self._auto_clear_btn = QPushButton("AUTO CLR")
+        self._auto_clear_btn.setFixedSize(62, 30)
+        self._auto_clear_btn.setToolTip("全トラックとMASTERのオートメーションを消去")
+        self._auto_clear_btn.setStyleSheet(self._transport_btn_style("#5b4216", "#806022", font_size=8))
+        self._auto_clear_btn.clicked.connect(self._on_auto_clear)
+        outer.addWidget(self._auto_clear_btn)
+
         self._playing_indicator = QLabel("●")
         self._playing_indicator.setStyleSheet(f"color: #333; font-size: 14px;")
         outer.addWidget(self._playing_indicator)
-        outer.addSpacing(8)
+        outer.addSpacing(3)
 
         self._save_btn = QPushButton("SAVE")
-        self._save_btn.setFixedSize(64, 30)
+        self._save_btn.setFixedSize(56, 30)
         self._save_btn.setStyleSheet(self._transport_btn_style(Colors.BTN_SAVE, Colors.BTN_SAVE_HOV, font_size=9))
         self._save_btn.clicked.connect(self._on_save_project)
         outer.addWidget(self._save_btn)
 
         self._save_as_btn = QPushButton("SAVE AS")
-        self._save_as_btn.setFixedSize(74, 30)
+        self._save_as_btn.setFixedSize(64, 30)
         self._save_as_btn.setStyleSheet(self._transport_btn_style(Colors.BTN_SAVE, Colors.BTN_SAVE_HOV, font_size=9))
         self._save_as_btn.clicked.connect(self._on_save_project_as)
         outer.addWidget(self._save_as_btn)
 
         self._open_btn = QPushButton("OPEN")
-        self._open_btn.setFixedSize(64, 30)
+        self._open_btn.setFixedSize(56, 30)
         self._open_btn.setStyleSheet(self._transport_btn_style(Colors.BTN_OPEN, Colors.BTN_OPEN_HOV, font_size=9))
         self._open_btn.clicked.connect(self._on_open_project)
         outer.addWidget(self._open_btn)
-        outer.addSpacing(8)
+        outer.addSpacing(3)
 
         self._add_marker_btn = QPushButton("▼  ADD MARKER")
-        self._add_marker_btn.setFixedSize(104, 30)
+        self._add_marker_btn.setFixedSize(90, 30)
         self._add_marker_btn.setStyleSheet(self._transport_btn_style("#5d4037", "#795548", font_size=8))
         self._add_marker_btn.setToolTip("現在の再生位置にマーカーを追加")
         self._add_marker_btn.clicked.connect(self._on_add_marker)
         outer.addWidget(self._add_marker_btn)
 
         self._marker_combo = QComboBox()
-        self._marker_combo.setFixedSize(132, 30)
+        self._marker_combo.setFixedSize(118, 30)
         self._marker_combo.setStyleSheet(f"""
             QComboBox {{
                 background: #222; color: #ffd700; border: 1px solid #5d4037;
@@ -4418,6 +4449,7 @@ class MixerMainWindow(QMainWindow):
         self._tracks[track_id].volume = volume
         any_solo = any(t.solo for t in self._tracks)
         self._engine.update_track(self._tracks[track_id], any_solo)
+        self._engine.record_track_automation(track_id, "volume", volume)
         # UNDO記録（値が変化した場合のみ）
         if abs(old_vol - volume) > 0.001:
             def _apply_vol(tid, v):
@@ -4435,6 +4467,7 @@ class MixerMainWindow(QMainWindow):
         self._tracks[track_id].pan = pan
         any_solo = any(t.solo for t in self._tracks)
         self._engine.update_track(self._tracks[track_id], any_solo)
+        self._engine.record_track_automation(track_id, "pan", pan)
         if abs(old_pan - pan) > 0.001:
             def _apply_pan(tid, p):
                 self._tracks[tid].pan = p
@@ -4679,6 +4712,37 @@ class MixerMainWindow(QMainWindow):
         self._pause_btn.setStyleSheet(
             self._transport_btn_style(Colors.BTN_PAUSE, Colors.BTN_PAUSE_HOV))
 
+    def _on_auto_rec_toggle(self, recording: bool):
+        """Phase 27: 録音をarmする。実際の点記録は再生中の操作だけに限定する。"""
+        self._automation_recording = bool(recording)
+        self._engine.set_automation_recording(self._automation_recording)
+        state = "ARMED (playback changes will be recorded)" if recording else "OFF"
+        self._set_status(f"AUTOMATION REC: {state}")
+
+    def _on_auto_play_toggle(self, enabled: bool):
+        """Phase 27: 記録済みレーンの適用を切り替える。"""
+        self._automation_enabled = bool(enabled)
+        self._engine.set_automation_enabled(self._automation_enabled)
+        self._set_status(f"AUTOMATION PLAY: {'ON' if enabled else 'OFF'}")
+
+    def _on_auto_clear(self):
+        """Phase 27: 明示確認の後に全オートメーションを消去する。"""
+        answer = QMessageBox.question(
+            self, "Clear Automation",
+            "Clear all track volume/PAN and MASTER X-FADER automation?\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        for track in self._tracks:
+            track.automation = {}
+        self._engine.clear_automation()
+        self._automation_enabled = False
+        self._automation_recording = False
+        self._auto_play_btn.setChecked(False)
+        self._auto_rec_btn.setChecked(False)
+        self._set_status("AUTOMATION: cleared")
+
     def _on_master_volume_changed(self, volume: float):
         from project_store import MasterVolumeCommand
         old_vol = self._engine.get_master_volume()
@@ -4703,6 +4767,7 @@ class MixerMainWindow(QMainWindow):
     def _on_master_xfade_changed(self, position: float, curve: str, cut_a: bool, cut_b: bool):
         """Phase 25: MASTER X-FADERをBrokerへ反映する。"""
         self._engine.set_master_xfade(position, curve, cut_a, cut_b)
+        self._engine.record_master_automation("xfade_position", position)
         curve_label = curve.replace("_", " ").upper()
         self._set_status(f"X-FADER: {position * 100:.0f}% / {curve_label}")
 
@@ -5182,6 +5247,8 @@ class MixerMainWindow(QMainWindow):
 
     def _save_to_path(self, path: str):
         store = ProjectStore(project_path=path)
+        for track in self._tracks:
+            track.automation = self._engine.get_automation_track_data(track.track_id)
         master_vol = self._engine.get_master_volume()
         limiter_enabled, limiter_ceiling_db, limiter_release_ms = self._engine.get_master_limiter_state()
         master_xfade = self._engine.get_master_xfade_state()
@@ -5190,7 +5257,8 @@ class MixerMainWindow(QMainWindow):
                             "enabled": limiter_enabled,
                             "ceiling_db": limiter_ceiling_db,
                             "release_ms": limiter_release_ms,
-                        }, master_xfade=master_xfade)
+                        }, master_xfade=master_xfade,
+                        master_automation=self._engine.get_automation_master_data())
         if ok:
             self._current_project_path = path
             self._update_project_label(path)
@@ -5254,6 +5322,17 @@ class MixerMainWindow(QMainWindow):
         )
         if self._master_widget:
             self._master_widget.restore_xfade_state(xfade_state)
+
+        # Phase 27: 保存済みレーンは初期停止状態で読み込み、AUTO PLAYで適用する。
+        self._automation_enabled = False
+        self._automation_recording = False
+        self._engine.configure_automation(
+            self._tracks, store.get_master_automation_state(), enabled=False, recording=False,
+        )
+        if self._auto_play_btn:
+            self._auto_play_btn.setChecked(False)
+        if self._auto_rec_btn:
+            self._auto_rec_btn.setChecked(False)
 
         # EQカーブを復元（全トラック）
         from eq_engine import EQParams

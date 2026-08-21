@@ -335,6 +335,19 @@ UNDO/REDOは、現在のようにスライダー値のたびに履歴を積ま�
 
 UIはBrokerの状態をポーリングしない。表示済みのローカル値を更新し、音声スレッドからはVU、GR、再生位置などの観測値だけをスレッドセーフなメーター用スナップショット経由で読む。
 
+### 9.1 Phase 27 オートメーション実装仕様
+
+`automation_engine.py`の`AutomationManager`が、トラックごとの`volume`・`pan`レーンとMASTERの`xfade_position`レーンを保持する。各レーンは`{"time_sec": float, "value": float}`の昇順ポイント列であり、25ms以内の連続ポイントは最新値へ統合する。ポイント間は線形補間し、最初のポイント以前および最終ポイント以後は端点値を維持する。
+
+| 操作 | 条件 | 実装上の扱い |
+|---|---|---|
+| AUTO REC | ONかつ再生中 | UI操作のフェーダー、PAN、X-FADERを共通タイムライン時刻で記録する。停止中の操作は記録しない。 |
+| AUTO PLAY | ON | 音声スレッドが各チャンク生成直前にレーンを評価し、`source="automation"`としてBrokerへ送る。 |
+| AUTO CLR | 確認後 | 全トラック・MASTERのレーンを消去し、AUTO REC/PLAYをOFFへ戻す。 |
+| SAVE / OPEN | 常時 | トラックの`automation`と`master_automation`をschema 10.0へ保存する。OPEN後のAUTO PLAYは安全のためOFF。 |
+
+`AutomationManager`はRLockで保護する。UIスレッドは記録・保存用データ取得だけを行い、音声スレッドは補間評価だけを行う。手動Patchの優先度は200、automationは100であるため、手動操作が同じキーを更新した時点では手動値が優先される。
+
 ---
 
 ## 10. Transport Epochと例外時の安全動作
@@ -361,7 +374,7 @@ STOP、LOAD、BANK切替、プロジェクトOPEN、再生開始／終了は連�
 | P24-4 ランプ | `audio_ramp.py`（新規） | Linear、Equal-Power、dB→gain、途中再ターゲット。 |
 | P25 X-FADER UI | `mixer_ui.py` | X-FADER、A/B/THRU、Curve、CUT、SWAP。 |
 | P26 EQ Morph UI | `mixer_ui.py` | Snap A/B、Morph、参照カーブ、状態表示。 |
-| P27 Automation | 新規モジュール | Read/Writeイベント列、再生時Broker送信。 |
+| P27 Automation | `automation_engine.py` / `audio_engine.py` / `mixer_ui.py` | Read/Writeイベント列、25ms統合、線形補間、Broker送信、AUTO操作UI、保存・復元。 |
 
 `audio_param_broker.py`と`audio_ramp.py`はPyQt・pygameに依存させない。これによりヘッドレスユニットテストで決定性と競合を検証できる。
 
@@ -377,7 +390,8 @@ STOP、LOAD、BANK切替、プロジェクトOPEN、再生開始／終了は連�
 | BKR-02 | PAN、EQ、X-FADERを別スレッドから同時送信 | 同一generationのSnapshotに全キーが矛盾なく含まれる。 |
 | BKR-03 | `wait_for_generation()`待機中にPatch | 世代番号で必ず起床または次回ループで検出し、更新を失わない。 |
 | BKR-04 | STOP後に旧Epoch Patch | 旧PatchがSnapshotへ入らない。 |
-| BKR-05 | ManualとAutomationが同じキーを更新 | Manualが優先され、解除後にAutomationが再開する。 |
+| BKR-05 | ManualとAutomationが同じキーを更新 | Manual（優先度200）がAutomation（100）より優先される。 |
+| BKR-06 | AUTO PLAYで1秒時点の補間値を評価 | track volume/PANとMASTER X-FADERが期待する線形補間値のSnapshotになる。 |
 
 ### 12.2 DSP・統合テスト
 
@@ -389,10 +403,11 @@ STOP、LOAD、BANK切替、プロジェクトOPEN、再生開始／終了は連�
 | DSP-04 | 操作中にREC→EXPORT | 録音WAVにX-FADERとMorphの変化が反映される。 |
 | DSP-05 | 操作中にLOOP/STOP/PLAY | 旧Epochの値が再生開始後に復活しない。 |
 | DSP-06 | 8トラック＋EQ＋FX＋Limiter | 目標Windows環境でQueue underrunなし。処理時間のp95はチャンク長の70%未満を目標とする。 |
+| DSP-07 | AUTO REC中にFader/PAN/X-FADERを操作 | 再生中の操作だけがポイント化され、保存後の読み込みで時刻・値が一致する。 |
 
 ### 12.3 人による実機評価
 
-受入テストでは、ヘッドフォンでX-FADER中央通過時の定位・音圧、EQ Morph中のクリック、フェーダー操作とEQ操作の組合せ、短いLOOP境界、PAUSE/RESUME、REC WAVの聞き比べを確認する。自動テストは状態整合性を保証するが、クリック感・音楽的な音圧変化・操作感は実機評価を必須とする。
+受入テストでは、ヘッドフォンでX-FADER中央通過時の定位・音圧、EQ Morph中のクリック、フェーダー操作とEQ操作の組合せ、短いLOOP境界、PAUSE/RESUME、REC WAVの聞き比べに加え、AUTO RECで記録したフェーダー・PAN・X-FADERがAUTO PLAYで意図したタイミングに再現され、クリックや意図しない無音がないことを確認する。自動テストは状態整合性を保証するが、クリック感・音楽的な音圧変化・操作感は実機評価を必須とする。
 
 ---
 
@@ -404,7 +419,7 @@ STOP、LOAD、BANK切替、プロジェクトOPEN、再生開始／終了は連�
 | Phase 24B | Fader/PAN/MUTE/SOLO/MASTERのランプ移行 | 既存機能の回帰なし、ドラッグは1件のUNDOに圧縮される。 |
 | Phase 25 | X-FADER | A/B/THRU、Curve、CUT、SWAP、保存・REC/WAV反映が完了する。 |
 | Phase 26 | EQ Morph | A/B保存、Morph、個別EQ競合規則、EQカーブ表示が完了する。 |
-| Phase 27 | オートメーション | Volume/PAN/X-FADERのWrite/Readが決定的に再現される。 |
+| Phase 27 | オートメーション | **実装済み**。Volume/PAN/X-FADERのWrite/Read、25ms統合、線形補間、Broker適用、保存・復元、ヘッドレス・GUIスモークテストを完了。 |
 
 **Phase 24の着手判定**は、Brokerを先にヘッドレステストで完成させ、既存の`AudioEngine` APIを一度に置き換えず、`update_gain()`と`set_master_volume()`から段階的に接続することとする。音声エンジンの大規模な一括変更は行わない。
 
