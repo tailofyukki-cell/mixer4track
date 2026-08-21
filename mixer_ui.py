@@ -2417,6 +2417,7 @@ class TrackWidget(QFrame):
     mic_toggled         = pyqtSignal(int)  # (track_id) - MICボタンクリック時
     aux_toggled         = pyqtSignal(int)  # (track_id) - AUXボタンクリック時
     xfade_assign_changed = pyqtSignal(int, str)  # (track_id, A/B/THRU)
+    eq_morph_changed    = pyqtSignal(int, object, object, object, float, bool)
 
     # キーボードショートカット（バンク内インデックス 0～7）
     KEY_LABELS = ["A / Z", "S / X", "D / C", "F / V", "G / B", "H / N", "J / M", "K / ,"]
@@ -2539,6 +2540,41 @@ class TrackWidget(QFrame):
         )
         self._eq_widget.eq_changed.connect(self.eq_changed)
         layout.addWidget(self._eq_widget)
+
+        # Phase 26: EQ Snapshot A/B と Morph。A/Bは左クリックで呼出、右クリックで現在値を保存。
+        morph_layout = QVBoxLayout()
+        morph_layout.setContentsMargins(1, 0, 1, 0)
+        morph_layout.setSpacing(1)
+        morph_row = QHBoxLayout()
+        morph_row.setSpacing(3)
+        morph_label = QLabel("MORPH")
+        morph_label.setFixedWidth(31)
+        morph_label.setStyleSheet("color:#d19cff; font-size:7px; font-weight:bold;")
+        self._eq_snap_a_btn = QPushButton("A")
+        self._eq_snap_b_btn = QPushButton("B")
+        for button, slot, tip in (
+            (self._eq_snap_a_btn, "A", "左クリック: EQ Snapshot Aを呼出 / 右クリック: 現在EQをAへ保存"),
+            (self._eq_snap_b_btn, "B", "左クリック: EQ Snapshot Bを呼出 / 右クリック: 現在EQをBへ保存"),
+        ):
+            button.setFixedSize(19, 17)
+            button.setToolTip(tip)
+            button.setStyleSheet("QPushButton { background:#362a4d; color:#e3d3ff; border:1px solid #76569b; border-radius:2px; font-size:8px; font-weight:bold; } QPushButton:hover { background:#5a3d78; }")
+            button.setContextMenuPolicy(Qt.CustomContextMenu)
+            button.customContextMenuRequested.connect(lambda _pos, key=slot: self._store_eq_snapshot(key))
+            button.clicked.connect(lambda _checked=False, key=slot: self._recall_eq_snapshot(key))
+        self._eq_morph_slider = QSlider(Qt.Horizontal)
+        self._eq_morph_slider.setRange(0, 100)
+        self._eq_morph_slider.setValue(int(round(self._track.eq_morph_position * 100)))
+        self._eq_morph_slider.setFixedHeight(17)
+        self._eq_morph_slider.setToolTip("EQ Morph: A ← → B")
+        self._eq_morph_slider.setStyleSheet("QSlider::groove:horizontal { height:3px; background:#382b4a; border-radius:1px; } QSlider::sub-page:horizontal { background:#a56bde; border-radius:1px; } QSlider::handle:horizontal { width:10px; margin:-4px 0; background:#ead8ff; border:1px solid #9261bc; border-radius:5px; }")
+        self._eq_morph_slider.valueChanged.connect(self._on_eq_morph_changed)
+        morph_row.addWidget(morph_label)
+        morph_row.addWidget(self._eq_snap_a_btn)
+        morph_row.addWidget(self._eq_morph_slider, 1)
+        morph_row.addWidget(self._eq_snap_b_btn)
+        morph_layout.addLayout(morph_row)
+        layout.addLayout(morph_layout)
 
         # ミュート / ソロ / MIC / AUX
         ms_layout = QHBoxLayout()
@@ -2826,6 +2862,73 @@ class TrackWidget(QFrame):
         """GAINを0dBにリセットする。"""
         self._gain_slider.setValue(0)  # valueChangedシグナルが発火される
 
+    @staticmethod
+    def _copy_eq_params(params: EQParams) -> EQParams:
+        return EQParams(
+            low_gain_db=params.low_gain_db,
+            mid_gain_db=params.mid_gain_db,
+            mid_freq_hz=params.mid_freq_hz,
+            mid_q=params.mid_q,
+            high_gain_db=params.high_gain_db,
+        )
+
+    def _eq_snapshot_params(self, slot: str) -> EQParams:
+        values = getattr(self._track, f"eq_snap_{slot.lower()}", {}) or {}
+        current = self._eq_widget.get_params()
+        return EQParams(
+            low_gain_db=float(values.get("low_gain_db", current.low_gain_db)),
+            mid_gain_db=float(values.get("mid_gain_db", current.mid_gain_db)),
+            mid_freq_hz=float(values.get("mid_freq_hz", current.mid_freq_hz)),
+            mid_q=float(values.get("mid_q", current.mid_q)),
+            high_gain_db=float(values.get("high_gain_db", current.high_gain_db)),
+        )
+
+    @staticmethod
+    def _eq_params_dict(params: EQParams) -> dict:
+        return {
+            "low_gain_db": float(params.low_gain_db),
+            "mid_gain_db": float(params.mid_gain_db),
+            "mid_freq_hz": float(params.mid_freq_hz),
+            "mid_q": float(params.mid_q),
+            "high_gain_db": float(params.high_gain_db),
+        }
+
+    def _emit_eq_morph(self, current: EQParams, position: float, enabled: bool):
+        snap_a = self._eq_snapshot_params("A")
+        snap_b = self._eq_snapshot_params("B")
+        self.eq_morph_changed.emit(
+            self._track.track_id, self._copy_eq_params(current), snap_a, snap_b,
+            max(0.0, min(1.0, float(position))), bool(enabled)
+        )
+
+    def _store_eq_snapshot(self, slot: str):
+        params = self._copy_eq_params(self._eq_widget.get_params())
+        setattr(self._track, f"eq_snap_{slot.lower()}", self._eq_params_dict(params))
+        self._emit_eq_morph(params, self._track.eq_morph_position, self._track.eq_morph_enabled)
+        self.setToolTip(f"EQ Snapshot {slot} を保存しました")
+
+    def _recall_eq_snapshot(self, slot: str):
+        params = self._eq_snapshot_params(slot)
+        position = 0.0 if slot == "A" else 1.0
+        self._track.eq_morph_position = position
+        self._track.eq_morph_enabled = True
+        self._eq_morph_slider.blockSignals(True)
+        self._eq_morph_slider.setValue(int(round(position * 100)))
+        self._eq_morph_slider.blockSignals(False)
+        self._eq_widget.restore_params(params)
+        self._emit_eq_morph(params, position, True)
+
+    def _on_eq_morph_changed(self, value: int):
+        position = max(0.0, min(1.0, value / 100.0))
+        from audio_param_broker import EQSnapshot
+        snap_a = EQSnapshot.from_params(self._eq_snapshot_params("A"))
+        snap_b = EQSnapshot.from_params(self._eq_snapshot_params("B"))
+        current = snap_a.interpolate(snap_b, position).to_params()
+        self._track.eq_morph_position = position
+        self._track.eq_morph_enabled = True
+        self._eq_widget.restore_params(current)
+        self._emit_eq_morph(current, position, True)
+
     def set_loading(self, loading: bool):
         """ロード中はLOADボタンを無効化し、テキストを変更する。"""
         self._load_btn.setEnabled(not loading)
@@ -2888,6 +2991,9 @@ class TrackWidget(QFrame):
         self._solo_btn.setStyleSheet(self._btn_style(track.solo, is_mute=False))
         self.update_aux_state(track.aux_enabled)
         self.update_xfade_assign(track.xfade_assign)
+        self._eq_morph_slider.blockSignals(True)
+        self._eq_morph_slider.setValue(int(round(track.eq_morph_position * 100)))
+        self._eq_morph_slider.blockSignals(False)
         self._file_label.setText(track.get_file_display_name())
         # ゲインを復元
         self._gain_slider.blockSignals(True)
@@ -3834,6 +3940,7 @@ class MixerMainWindow(QMainWindow):
             tw.mute_toggled.connect(self._on_mute_toggled)
             tw.solo_toggled.connect(self._on_solo_toggled)
             tw.eq_changed.connect(self._on_eq_changed)
+            tw.eq_morph_changed.connect(self._on_eq_morph_changed)
             tw.mic_toggled.connect(self._on_mic_toggled)
             tw.aux_toggled.connect(self._on_aux_toggled)
             tw.xfade_assign_changed.connect(self._on_xfade_assign_changed)
@@ -4465,10 +4572,23 @@ class MixerMainWindow(QMainWindow):
         track.eq_mid_freq  = params.mid_freq_hz
         track.eq_mid_q     = params.mid_q
         track.eq_high_gain = params.high_gain_db
+        # Phase 26: ノブ／プリセットの手動操作はMorphを解除してその値を優先する。
+        track.eq_morph_enabled = False
         # EQカーブを即時更新
         self._track_widgets[track_id].update_eq_curve(params)
-        # リアルタイム反映（次チャンクから即適用）
-        self._engine.update_eq(track_id, params)
+        # リアルタイム反映（次チャンクから即適用）。Morph有効状態も同時に解除する。
+        def _snap_params(values):
+            return EQParams(
+                low_gain_db=float(values.get("low_gain_db", params.low_gain_db)),
+                mid_gain_db=float(values.get("mid_gain_db", params.mid_gain_db)),
+                mid_freq_hz=float(values.get("mid_freq_hz", params.mid_freq_hz)),
+                mid_q=float(values.get("mid_q", params.mid_q)),
+                high_gain_db=float(values.get("high_gain_db", params.high_gain_db)),
+            )
+        self._engine.update_eq_morph(
+            track_id, params, _snap_params(track.eq_snap_a), _snap_params(track.eq_snap_b),
+            track.eq_morph_position, False,
+        )
         # UNDO記録
         def _apply_eq(tid, p):
             t = self._tracks[tid]
@@ -4478,10 +4598,43 @@ class MixerMainWindow(QMainWindow):
             t.eq_mid_q    = p.mid_q
             t.eq_high_gain = p.high_gain_db
             self._track_widgets[tid].update_eq_curve(p)
-            self._engine.update_eq(tid, p)
+            self._engine.update_eq_morph(
+                tid, p, _snap_params(t.eq_snap_a), _snap_params(t.eq_snap_b),
+                t.eq_morph_position, False,
+            )
         cmd = EQCommand(track_id, old_params, params, _apply_eq)
         self._history.push(cmd)
         self._update_undo_redo_buttons()
+
+    def _on_eq_morph_changed(self, track_id: int, current_params, snap_a, snap_b,
+                             position: float, enabled: bool):
+        """Phase 26: EQ A/B SnapshotとMorph状態をモデル・Brokerへ同期する。"""
+        track = self._tracks[track_id]
+        track.eq_low_gain = current_params.low_gain_db
+        track.eq_mid_gain = current_params.mid_gain_db
+        track.eq_mid_freq = current_params.mid_freq_hz
+        track.eq_mid_q = current_params.mid_q
+        track.eq_high_gain = current_params.high_gain_db
+        track.eq_snap_a = {
+            "low_gain_db": snap_a.low_gain_db, "mid_gain_db": snap_a.mid_gain_db,
+            "mid_freq_hz": snap_a.mid_freq_hz, "mid_q": snap_a.mid_q,
+            "high_gain_db": snap_a.high_gain_db,
+        }
+        track.eq_snap_b = {
+            "low_gain_db": snap_b.low_gain_db, "mid_gain_db": snap_b.mid_gain_db,
+            "mid_freq_hz": snap_b.mid_freq_hz, "mid_q": snap_b.mid_q,
+            "high_gain_db": snap_b.high_gain_db,
+        }
+        track.eq_morph_position = max(0.0, min(1.0, float(position)))
+        track.eq_morph_enabled = bool(enabled)
+        self._track_widgets[track_id].update_eq_curve(current_params)
+        self._engine.update_eq_morph(
+            track_id, current_params, snap_a, snap_b,
+            track.eq_morph_position, track.eq_morph_enabled,
+        )
+        self._set_status(
+            f"Track {track_id + 1}: EQ MORPH {track.eq_morph_position * 100:.0f}%"
+        )
 
     def _on_play(self):
         loaded = [t for t in self._tracks if t.file_path is not None]

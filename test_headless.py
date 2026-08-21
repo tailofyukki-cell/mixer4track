@@ -916,6 +916,62 @@ def test_xfade_project_store():
 
 
 # ===========================================================================
+# Phase 26: EQ Snapshot A/B・Morph テスト
+# ===========================================================================
+def test_eq_snap_morph():
+    print("=== Phase 26: EQ Snapshot A/B・Morphテスト ===")
+    snap_a = EQParams(low_gain_db=-6.0, mid_gain_db=-3.0, mid_freq_hz=500.0, mid_q=0.7, high_gain_db=-4.0)
+    snap_b = EQParams(low_gain_db=6.0, mid_gain_db=9.0, mid_freq_hz=2000.0, mid_q=2.8, high_gain_db=8.0)
+    track = TrackModel(track_id=0)
+    track.eq_snap_a = {
+        "low_gain_db": -6.0, "mid_gain_db": -3.0, "mid_freq_hz": 500.0,
+        "mid_q": 0.7, "high_gain_db": -4.0,
+    }
+    track.eq_snap_b = {
+        "low_gain_db": 6.0, "mid_gain_db": 9.0, "mid_freq_hz": 2000.0,
+        "mid_q": 2.8, "high_gain_db": 8.0,
+    }
+    track.eq_morph_position = 0.5
+    track.eq_morph_enabled = True
+
+    broker = AudioParamBroker(num_tracks=1)
+    broker.reset_from_tracks([track], 1.0, eq_by_track={0: snap_a})
+    initial = broker.snapshot().track_for(0).dsp
+    assert initial.eq_morph_enabled
+    assert abs(initial.eq_snap_a.low_gain_db + 6.0) < 1e-6
+    assert abs(initial.eq_snap_b.high_gain_db - 8.0) < 1e-6
+
+    broker.submit_track_dsp(
+        0, eq_snap_a=snap_a, eq_snap_b=snap_b,
+        eq_morph_position=0.5, eq_morph_enabled=True,
+    )
+    dsp = broker.snapshot().track_for(0).dsp
+    morphed = dsp.eq_snap_a.interpolate(dsp.eq_snap_b, dsp.eq_morph_position)
+    assert abs(morphed.low_gain_db - 0.0) < 1e-6
+    assert abs(morphed.high_gain_db - 2.0) < 1e-6
+    assert abs(morphed.mid_freq_hz - 1000.0) < 1e-6  # log補間: sqrt(500 * 2000)
+    assert abs(morphed.mid_q - 1.4) < 1e-6
+
+    streamer = _TrackStreamer(0, np.full((CHUNK_SAMPLES, 2), 0.2, dtype=np.float32), 44100)
+    streamer.apply_dsp_params(dsp)
+    assert abs(streamer._eq_params.mid_freq_hz - 1000.0) < 1e-6
+    assert abs(streamer._eq_params.high_gain_db - 2.0) < 1e-6
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "eq_morph_project.m4t")
+        store = ProjectStore(project_path=path)
+        assert store.save([track])
+        loaded = store.load()
+        assert loaded is not None
+        loaded_track = loaded[0][0]
+        assert loaded_track.eq_snap_a["mid_freq_hz"] == 500.0
+        assert loaded_track.eq_snap_b["mid_freq_hz"] == 2000.0
+        assert abs(loaded_track.eq_morph_position - 0.5) < 1e-6
+        assert loaded_track.eq_morph_enabled
+    print("  EQ Snapshot A/B・Morph: OK")
+
+
+# ===========================================================================
 # build_windows.bat ASCII チェック
 # ===========================================================================
 def test_bat_ascii():
@@ -953,6 +1009,7 @@ if __name__ == "__main__":
         test_audio_param_broker()
         test_audio_engine_broker_integration()
         test_xfade_project_store()
+        test_eq_snap_morph()
         test_bat_ascii()
         print("\n=== 全テスト合格 ===")
         sys.exit(0)

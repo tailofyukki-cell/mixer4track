@@ -33,6 +33,10 @@ class TrackModel:
     aux_enabled: bool = False             # AUX ON/OFF: TrueのトラックのみにFXを適用（Phase 19）
     gain_db: float = 0.0                  # 入力ゲイン補正 -24dB〜+24dB（Phase 7）
     xfade_assign: str = "THRU"            # X-FADER割当: A / B / THRU（Phase 25）
+    eq_snap_a: Dict[str, float] = field(default_factory=dict)  # EQ Snapshot A（Phase 26）
+    eq_snap_b: Dict[str, float] = field(default_factory=dict)  # EQ Snapshot B（Phase 26）
+    eq_morph_position: float = 0.0         # EQ Morph 0.0=A / 1.0=B（Phase 26）
+    eq_morph_enabled: bool = False         # EQ Morph有効状態（Phase 26）
     waveform_data: Optional[list] = field(default=None, repr=False)  # 波形データ
 
     def get_display_name(self) -> str:
@@ -98,6 +102,10 @@ class TrackModel:
             "gain_db":        self.gain_db,
             "aux_enabled":    self.aux_enabled,
             "xfade_assign":   self.xfade_assign,
+            "eq_snap_a":      dict(self.eq_snap_a),
+            "eq_snap_b":      dict(self.eq_snap_b),
+            "eq_morph_position": self.eq_morph_position,
+            "eq_morph_enabled": self.eq_morph_enabled,
         }
 
     @classmethod
@@ -124,4 +132,8 @@ class TrackModel:
             aux_enabled=data.get("aux_enabled", False),
             xfade_assign=str(data.get("xfade_assign", "THRU")).upper()
                 if str(data.get("xfade_assign", "THRU")).upper() in ("A", "B", "THRU") else "THRU",
+            eq_snap_a=dict(data.get("eq_snap_a", {})),
+            eq_snap_b=dict(data.get("eq_snap_b", {})),
+            eq_morph_position=max(0.0, min(1.0, float(data.get("eq_morph_position", 0.0)))),
+            eq_morph_enabled=bool(data.get("eq_morph_enabled", False)),
         )

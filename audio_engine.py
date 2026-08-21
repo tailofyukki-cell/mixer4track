@@ -124,7 +124,14 @@ class _TrackStreamer:
         with self._lock:
             if abs(self._gain_db - params.gain_db) > 0.000001:
                 self._gain_db = params.gain_db
-            eq_params = params.eq.to_params()
+            # Phase 26: Morph中はA/B Snapshotを補間し、既存EQEngineの
+            # 二重フィルタ・クロスフェード経路で連続的に切り替える。
+            eq_snapshot = params.eq
+            if params.eq_morph_enabled:
+                eq_snapshot = params.eq_snap_a.interpolate(
+                    params.eq_snap_b, params.eq_morph_position
+                )
+            eq_params = eq_snapshot.to_params()
             if self._eq_params.to_dict() != eq_params.to_dict():
                 self._eq_params = eq_params
                 self._eq_engine.set_params(eq_params)
@@ -440,6 +447,22 @@ class AudioEngine:
         """EQ更新をBrokerへ登録する。クロスフェード開始は音声スレッドが担う。"""
         self._eq_params[track_id] = params
         self._param_broker.submit_track_dsp(track_id, eq_params=params)
+        self._param_changed_event.set()
+
+    def update_eq_morph(self, track_id: int, current_params: EQParams,
+                        snap_a: EQParams, snap_b: EQParams,
+                        position: float, enabled: bool):
+        """Phase 26: EQ A/BとMorph状態を一つのBroker generationとして更新する。"""
+        position = max(0.0, min(1.0, float(position)))
+        self._eq_params[track_id] = current_params
+        self._param_broker.submit_track_dsp(
+            track_id,
+            eq_params=current_params,
+            eq_snap_a=snap_a,
+            eq_snap_b=snap_b,
+            eq_morph_position=position,
+            eq_morph_enabled=bool(enabled),
+        )
         self._param_changed_event.set()
 
     def update_effect(self, track_id: int, preset_name: str, enabled: bool):

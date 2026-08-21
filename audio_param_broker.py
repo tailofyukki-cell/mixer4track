@@ -8,7 +8,7 @@ UIは最新の意図だけをBrokerへ登録し、音声スレッドはチャン
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, Iterable, Literal, Optional, Tuple
 
 from track_model import TrackModel
@@ -46,6 +46,45 @@ class EQSnapshot:
         params.clamp()
         return params
 
+    @classmethod
+    def from_dict(cls, values: Optional[Dict[str, float]], fallback: Optional["EQSnapshot"] = None) -> "EQSnapshot":
+        values = values or {}
+        fallback = fallback or cls()
+        return cls(
+            low_gain_db=float(values.get("low_gain_db", fallback.low_gain_db)),
+            mid_gain_db=float(values.get("mid_gain_db", fallback.mid_gain_db)),
+            mid_freq_hz=float(values.get("mid_freq_hz", fallback.mid_freq_hz)),
+            mid_q=float(values.get("mid_q", fallback.mid_q)),
+            high_gain_db=float(values.get("high_gain_db", fallback.high_gain_db)),
+        )
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            "low_gain_db": self.low_gain_db,
+            "mid_gain_db": self.mid_gain_db,
+            "mid_freq_hz": self.mid_freq_hz,
+            "mid_q": self.mid_q,
+            "high_gain_db": self.high_gain_db,
+        }
+
+    def interpolate(self, other: "EQSnapshot", position: float) -> "EQSnapshot":
+        """A/Bを補間する。周波数とQは対数空間で補間する。"""
+        import math
+        x = max(0.0, min(1.0, float(position)))
+        def linear(a: float, b: float) -> float:
+            return a + (b - a) * x
+        def logarithmic(a: float, b: float) -> float:
+            a = max(1e-6, a)
+            b = max(1e-6, b)
+            return math.exp(math.log(a) + (math.log(b) - math.log(a)) * x)
+        return EQSnapshot(
+            low_gain_db=linear(self.low_gain_db, other.low_gain_db),
+            mid_gain_db=linear(self.mid_gain_db, other.mid_gain_db),
+            mid_freq_hz=logarithmic(self.mid_freq_hz, other.mid_freq_hz),
+            mid_q=logarithmic(self.mid_q, other.mid_q),
+            high_gain_db=linear(self.high_gain_db, other.high_gain_db),
+        )
+
 
 @dataclass(frozen=True)
 class GEQSnapshot:
@@ -76,6 +115,10 @@ class TrackDSPParams:
     effect_preset: str = "None"
     effect_enabled: bool = False
     aux_enabled: bool = False
+    eq_snap_a: EQSnapshot = field(default_factory=EQSnapshot)
+    eq_snap_b: EQSnapshot = field(default_factory=EQSnapshot)
+    eq_morph_position: float = 0.0
+    eq_morph_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -221,12 +264,17 @@ class AudioParamBroker:
             self._tracks = {}
             for track in tracks:
                 eq_params = eq_by_track.get(track.track_id)
+                current_eq = EQSnapshot.from_params(eq_params) if eq_params is not None else EQSnapshot()
                 dsp = TrackDSPParams(
                     gain_db=self._clamp_gain(float(gain_by_track.get(track.track_id, 0.0))),
-                    eq=EQSnapshot.from_params(eq_params) if eq_params is not None else EQSnapshot(),
+                    eq=current_eq,
                     effect_preset=str(effect_preset_by_track.get(track.track_id, "None")),
                     effect_enabled=bool(effect_enabled_by_track.get(track.track_id, False)),
                     aux_enabled=bool(aux_enabled_by_track.get(track.track_id, False)),
+                    eq_snap_a=EQSnapshot.from_dict(getattr(track, "eq_snap_a", {}), current_eq),
+                    eq_snap_b=EQSnapshot.from_dict(getattr(track, "eq_snap_b", {}), current_eq),
+                    eq_morph_position=self._clamp_morph_position(getattr(track, "eq_morph_position", 0.0)),
+                    eq_morph_enabled=bool(getattr(track, "eq_morph_enabled", False)),
                 )
                 self._tracks[track.track_id] = TrackMixParams(
                     track_id=track.track_id,
@@ -283,6 +331,10 @@ class AudioParamBroker:
                          effect_preset: Optional[str] = None,
                          effect_enabled: Optional[bool] = None,
                          aux_enabled: Optional[bool] = None,
+                         eq_snap_a: Optional[object] = None,
+                         eq_snap_b: Optional[object] = None,
+                         eq_morph_position: Optional[float] = None,
+                         eq_morph_enabled: Optional[bool] = None,
                          source: ParamSource = "manual",
                          transport_epoch: Optional[int] = None) -> int:
         """トラックDSPの複数値を一つのgenerationとして登録する。"""
@@ -297,6 +349,14 @@ class AudioParamBroker:
             patches.append(ParamPatch(("track", track_id, "effect_enabled"), effect_enabled, source, transport_epoch))
         if aux_enabled is not None:
             patches.append(ParamPatch(("track", track_id, "aux_enabled"), aux_enabled, source, transport_epoch))
+        if eq_snap_a is not None:
+            patches.append(ParamPatch(("track", track_id, "eq_snap_a"), EQSnapshot.from_params(eq_snap_a), source, transport_epoch))
+        if eq_snap_b is not None:
+            patches.append(ParamPatch(("track", track_id, "eq_snap_b"), EQSnapshot.from_params(eq_snap_b), source, transport_epoch))
+        if eq_morph_position is not None:
+            patches.append(ParamPatch(("track", track_id, "eq_morph_position"), eq_morph_position, source, transport_epoch))
+        if eq_morph_enabled is not None:
+            patches.append(ParamPatch(("track", track_id, "eq_morph_enabled"), eq_morph_enabled, source, transport_epoch))
         return self.submit_batch(ParamBatch(tuple(patches)))
 
     def submit_master_geq(self, params: object, *, source: ParamSource = "manual",
@@ -430,24 +490,31 @@ class AudioParamBroker:
             updated = TrackMixParams(track_id, current.volume, current.pan,
                                      current.muted, bool(patch.value), dsp, current.xfade_assign)
         elif field == "gain_db":
-            updated_dsp = TrackDSPParams(self._clamp_gain(float(patch.value)), dsp.eq,
-                                         dsp.effect_preset, dsp.effect_enabled, dsp.aux_enabled)
+            updated_dsp = replace(dsp, gain_db=self._clamp_gain(float(patch.value)))
             updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp, current.xfade_assign)
         elif field == "eq":
-            updated_dsp = TrackDSPParams(dsp.gain_db, patch.value,
-                                         dsp.effect_preset, dsp.effect_enabled, dsp.aux_enabled)
+            updated_dsp = replace(dsp, eq=patch.value)
             updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp, current.xfade_assign)
         elif field == "effect_preset":
-            updated_dsp = TrackDSPParams(dsp.gain_db, dsp.eq, str(patch.value),
-                                         dsp.effect_enabled, dsp.aux_enabled)
+            updated_dsp = replace(dsp, effect_preset=str(patch.value))
             updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp, current.xfade_assign)
         elif field == "effect_enabled":
-            updated_dsp = TrackDSPParams(dsp.gain_db, dsp.eq, dsp.effect_preset,
-                                         bool(patch.value), dsp.aux_enabled)
+            updated_dsp = replace(dsp, effect_enabled=bool(patch.value))
             updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp, current.xfade_assign)
         elif field == "aux_enabled":
-            updated_dsp = TrackDSPParams(dsp.gain_db, dsp.eq, dsp.effect_preset,
-                                         dsp.effect_enabled, bool(patch.value))
+            updated_dsp = replace(dsp, aux_enabled=bool(patch.value))
+            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp, current.xfade_assign)
+        elif field == "eq_snap_a":
+            updated_dsp = replace(dsp, eq_snap_a=patch.value)
+            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp, current.xfade_assign)
+        elif field == "eq_snap_b":
+            updated_dsp = replace(dsp, eq_snap_b=patch.value)
+            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp, current.xfade_assign)
+        elif field == "eq_morph_position":
+            updated_dsp = replace(dsp, eq_morph_position=self._clamp_morph_position(float(patch.value)))
+            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp, current.xfade_assign)
+        elif field == "eq_morph_enabled":
+            updated_dsp = replace(dsp, eq_morph_enabled=bool(patch.value))
             updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp, current.xfade_assign)
         elif field == "xfade_assign":
             updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo,
@@ -491,6 +558,10 @@ class AudioParamBroker:
 
     @staticmethod
     def _clamp_xfade_position(value: float) -> float:
+        return max(0.0, min(1.0, value))
+
+    @staticmethod
+    def _clamp_morph_position(value: float) -> float:
         return max(0.0, min(1.0, value))
 
     @staticmethod

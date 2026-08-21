@@ -1,6 +1,6 @@
-# Mixer4Track  [Phase 25]
+# Mixer4Track  [Phase 26]
 
-16トラック音楽ミキサーソフト — Phase 25: X-FADER追加版
+16トラック音楽ミキサーソフト — Phase 26: EQ Snapshot / Morph追加版
 
 ## 概要
 
@@ -426,10 +426,17 @@ mixer4track/
   - `.m4t`にトラック割当とMASTER X-FADER状態を保存・復元。RECおよびEXPORT WAVにも同じ状態を適用。
   - Broker、DSP、保存・復元、GUI操作の回帰テストを追加。
 
+### Phase 26
+- **EQ Snapshot A/B・EQ Morph**
+  - 各トラックにEQ Snapshot A/BとMorph位置・有効状態を追加。`.m4t`へ保存・復元。
+  - `MORPH`行をTrack EQの直下へ追加。A/Bボタンは左クリックで呼出、右クリックで現在EQを保存。中央スライダーでAからBまで連続補間。
+  - Broker SnapshotへA/BとMorph状態を追加。Mid Frequency／Qは対数補間、Low／Mid／High Gainは線形補間。
+  - 音声スレッドは補間EQを既存EQEngineの20msクロスフェード経路へ投入し、Morph操作時のDSP連続性を維持。
+  - 手動ノブ・プリセット操作はMorphを解除して手動EQを優先。Broker、DSP、保存・復元、GUI操作の回帰テストを追加。
+
 ## 将来拡張ロードマップ
 | Phase | 機能 |
 |-------|------|
-| Phase 26 | EQ Snap A/B・EQ Morph |
 | Phase 27 | オートメーション（フェーダー・PAN・X-FADERの時間軸変化） |
 | Phase 28 | MIDI コントローラー対応 |
 

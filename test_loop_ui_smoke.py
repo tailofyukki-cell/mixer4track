@@ -27,6 +27,17 @@ def main():
     assert window._tracks[0].xfade_assign == "A"
     window._master_widget._xfade_slider.setValue(100)
     assert abs(window._engine.get_master_xfade_state()["position"] - 1.0) < 1e-6
+    eq_widget = window._track_widgets[0]
+    assert eq_widget._eq_snap_a_btn is not None
+    assert eq_widget._eq_snap_b_btn is not None
+    assert eq_widget._eq_morph_slider.value() == 0
+    eq_widget._store_eq_snapshot("A")
+    eq_widget._eq_morph_slider.setValue(50)
+    assert window._tracks[0].eq_morph_enabled is True
+    assert abs(window._tracks[0].eq_morph_position - 0.5) < 1e-6
+    eq_widget._store_eq_snapshot("B")
+    eq_widget._recall_eq_snapshot("A")
+    assert abs(window._tracks[0].eq_morph_position - 0.0) < 1e-6
     window._marker_bar.set_loop_range(True, 1.0, 2.0)
     window._marker_bar.set_loop_range(False)
     QTimer.singleShot(0, app.quit)

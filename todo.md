@@ -75,10 +75,10 @@
 
 ## Phase 26: EQ Snap A/B・EQ Morph
 
-- [ ] EQ Snapshot A/BとMorph位置をモデル・Broker・保存形式へ追加する。
-- [ ] Track EQ UIにA/B保存・呼出・Morph操作を追加する。
-- [ ] 音声スレッドでMorphしたEQ設定をクロスフェード適用する。
-- [ ] EQ MorphのBroker・DSP・保存・GUIテストを実行し、GitHubへコミット・プッシュする。
+- [x] EQ Snapshot A/BとMorph位置をモデル・Broker・保存形式へ追加する。
+- [x] Track EQ UIにA/B保存・呼出・Morph操作を追加する。
+- [x] 音声スレッドでMorphしたEQ設定をクロスフェード適用する。
+- [x] EQ MorphのBroker・DSP・保存・GUIテストを実行し、GitHubへコミット・プッシュする。
 
 ## Phase 27: オートメーション
 
