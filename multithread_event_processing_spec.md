@@ -2,7 +2,7 @@
 
 **対象フェーズ**: Phase 24（AudioParamBroker）以降  
 **更新日**: 2026-08-19  
-**状態**: Phase 24A 実装済み（Fader / PAN / MUTE / SOLO / MASTER Volume）
+**状態**: Phase 24B 実装済み（Fader / PAN / MUTE / SOLO / MASTER Volume / GAIN / Track EQ / Track FX / AUX / MASTER GEQ）
 **前提**: 現在の `AudioEngine._master_mix_loop()`、44.1kHz、80msチャンク、`QUEUE_AHEAD=2` を維持する。
 
 ---
@@ -32,8 +32,8 @@
 
 | 現行要素 | 現行の動作 | 並行操作時の課題 | Broker導入後の扱い |
 |---|---|---|---|
-| `TrackWidget`のスライダー | UIイベントごとに直接エンジン更新 | UIイベントが多いとロック取得とUNDO履歴が過剰になる | 操作中は最新値だけをBrokerへ上書きする。 |
-| `_TrackStreamer` | 個別ロックの中でEQ/FX状態も変更 | UIスレッドがDSPオブジェクトへ直接触れる | 音声スレッドだけがDSPへパラメータを投入する。 |
+| `TrackWidget`のスライダー | UIイベントごとにBroker更新 | 高頻度イベントでも中間値を蓄積しない | 操作中は最新値だけをBrokerへ上書きする。 |
+| `_TrackStreamer` | 音声スレッドがSnapshotからEQ/FX状態を変更 | UIスレッドがDSPオブジェクトへ直接触れない | 音声スレッドだけがDSPへパラメータを投入する。 |
 | `_master_mix_loop()` | `QUEUE_AHEAD=2`で先読み | 既にキュー済みの最大160msは旧パラメータの音が残る | 仕様として最大反映遅延を定義し、Transport時のみキューを破棄する。 |
 | `_param_changed_event` | `Event.set()`/`clear()`で即時起床を促す | clear直前の更新を取りこぼす可能性がある | 世代番号付き`Condition`へ置換する。 |
 | `TrackModel`一覧 | UIスレッドと音声スレッドが同じ可変オブジェクトを参照 | 同一チャンクでMUTEとPANが異なる状態になる余地がある | 不変`AudioParamSnapshot`へ変換してから音声スレッドに渡す。 |

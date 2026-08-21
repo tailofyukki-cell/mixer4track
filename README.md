@@ -1,6 +1,6 @@
 # Mixer4Track  [Phase 24A]
 
-16トラック音楽ミキサーソフト — Phase 23: マスター・リミッター追加版
+16トラック音楽ミキサーソフト — Phase 24B: DSP Broker移行版
 
 ## 概要
 
@@ -291,6 +291,13 @@ mixer4track/
 - STOP時はTransport Epochを進め、停止前の保留Patchを無効化。
 - BrokerのPatch圧縮、手動操作優先、Transport Epoch、複数スレッド同時更新、AudioEngineミックス統合を自動テスト。
 
+### Phase 24B: DSPパラメータのBroker移行
+- Broker Snapshotを **GAIN / Track EQ / Track FX / AUX / MASTER GEQ** まで拡張。UIスレッドはDSPインスタンスを直接更新しない。
+- トラックDSPはチャンク境界でSnapshotを適用。GAINはチャンク内ランプ、EQは既存20msクロスフェード、FXのON/OFF・AUX切替はNoneプリセットへのクロスフェードを維持。
+- MASTER GEQは音声スレッドで新旧GEQエンジンを併走させ、20msクロスフェード後に旧インスタンスを解放。
+- `export_mix()` は開始時にBroker Snapshotを固定し、GAIN・EQ・FX/AUX・MASTER GEQ・ミックス設定が途中操作で混在しないよう改善。
+- DSP Patch圧縮、GAIN/EQ/FX/MASTER GEQのSnapshot化、2スレッド同時更新、MASTER GEQ遷移、REC/WAVを含む回帰テストを追加。
+
 ### 次期設計: 複数操作の並行実行
 - クロスフェード、EQ Morph、フェーダー、PAN、FXを安全に同時反映するための設計書を `concurrent_operations_spec.md` に追加。
 - 次の実装候補は、パラメータ更新をチャンク境界へ安全に渡す **AudioParamBroker** と、A/B/THRU割当を持つ **X-FADER**。
@@ -414,7 +421,6 @@ mixer4track/
 ## 将来拡張ロードマップ
 | Phase | 機能 |
 |-------|------|
-| Phase 24B | GAIN・EQ・FX・MASTER GEQをBrokerと音声スレッド所有へ段階移行 |
 | Phase 25 | X-FADER（A/B/THRU、Equal Power、CUT、SWAP） |
 | Phase 26 | EQ Snap A/B・EQ Morph |
 | Phase 27 | オートメーション（フェーダー・PAN・X-FADERの時間軸変化） |

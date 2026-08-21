@@ -22,6 +22,7 @@ from audio_engine import AudioEngine, CHUNK_SAMPLES, _TrackStreamer
 from audio_param_broker import AudioParamBroker, ParamBatch, ParamPatch
 from project_store import ProjectStore
 from eq_engine import EQEngine, EQParams, EQ_PRESETS
+from geq_engine import GEQParams
 
 
 # ===========================================================================
@@ -734,6 +735,53 @@ def test_audio_param_broker():
     current = broker.snapshot().track_for(0).muted
     broker.submit_track_mix(0, muted=not current, transport_epoch=stale_epoch)
     assert broker.snapshot().track_for(0).muted is current
+
+    # DSP Patchは複合状態としてSnapshotに格納される。
+    eq = EQParams(low_gain_db=6.0, mid_gain_db=-2.0, mid_freq_hz=1800.0,
+                  mid_q=1.5, high_gain_db=3.0)
+    geq = GEQParams()
+    geq.set_gain(1000.0, 4.0)
+    broker.submit_track_dsp(
+        0, gain_db=8.0, eq_params=eq, effect_preset="Reverb: Room",
+        effect_enabled=True, aux_enabled=True,
+    )
+    broker.submit_master_geq(geq)
+    dsp_snapshot = broker.snapshot()
+    track_dsp = dsp_snapshot.track_for(0).dsp
+    assert abs(track_dsp.gain_db - 8.0) < 1e-6
+    assert abs(track_dsp.eq.low_gain_db - 6.0) < 1e-6
+    assert track_dsp.effect_preset == "Reverb: Room"
+    assert track_dsp.effect_enabled and track_dsp.aux_enabled
+    assert abs(dsp_snapshot.master.dsp.geq.to_params().get_gain(1000.0) - 4.0) < 1e-6
+
+    # DSP系の複数操作も、キー別の最新値へ圧縮され一つのSnapshotに収束する。
+    def update_track_dsp():
+        for index in range(40):
+            broker.submit_track_dsp(
+                0,
+                gain_db=-12.0 + index * 0.5,
+                eq_params=EQParams(mid_gain_db=float(index % 12)),
+                effect_preset="Delay: Short" if index % 2 else "Reverb: Room",
+                effect_enabled=True,
+                aux_enabled=True,
+            )
+
+    def update_master_geq():
+        for index in range(40):
+            params = GEQParams()
+            params.set_gain(1000.0, -8.0 + index * 0.25)
+            broker.submit_master_geq(params)
+
+    dsp_threads = [threading.Thread(target=update_track_dsp),
+                   threading.Thread(target=update_master_geq)]
+    for worker in dsp_threads:
+        worker.start()
+    for worker in dsp_threads:
+        worker.join()
+    concurrent_dsp = broker.snapshot()
+    assert abs(concurrent_dsp.track_for(0).dsp.gain_db - 7.5) < 1e-6
+    assert concurrent_dsp.track_for(0).dsp.effect_preset == "Delay: Short"
+    assert abs(concurrent_dsp.master.dsp.geq.to_params().get_gain(1000.0) - 1.75) < 1e-6
     print("  AudioParamBroker: OK")
 
 
@@ -770,6 +818,37 @@ def test_audio_engine_broker_integration():
         master_changed = engine._param_broker.take_snapshot(changed.generation)
         assert master_changed is not None
         assert abs(master_changed.master.volume - 0.40) < 1e-6
+
+        # Phase 24B: GAIN・EQ・FX・MASTER GEQは音声スレッド側のDSP適用で反映される。
+        eq = EQParams(low_gain_db=4.0)
+        geq = GEQParams()
+        geq.set_gain(1000.0, 3.0)
+        engine.update_gain(0, 6.0)
+        engine.update_eq(0, eq)
+        engine.update_effect(0, "Reverb: Room", True)
+        engine.set_aux_track(0, True)
+        engine.update_master_geq(geq)
+        dsp_changed = engine._param_broker.take_snapshot(master_changed.generation)
+        assert dsp_changed is not None
+        dsp = dsp_changed.track_for(0).dsp
+        assert abs(dsp.gain_db - 6.0) < 1e-6
+        assert abs(dsp.eq.low_gain_db - 4.0) < 1e-6
+        assert dsp.effect_enabled and dsp.aux_enabled
+
+        dsp_streamer = _TrackStreamer(0, pcm, engine.SAMPLE_RATE)
+        dsp_streamer.apply_dsp_params(dsp)
+        dsp_chunk = dsp_streamer.next_chunk()
+        assert dsp_chunk is not None
+        # +6dB GAINとEQ/FX設定が適用済みで、無音ではないことを確認する。
+        assert float(np.max(np.abs(dsp_chunk))) > 0.5
+
+        engine._apply_master_dsp_snapshot(dsp_changed)
+        assert engine._master_geq_crossfade_remaining > 0
+        master_geq_out = engine._apply_master_geq_chunk(
+            np.full((CHUNK_SAMPLES, 2), 0.25, dtype=np.float32)
+        )
+        assert master_geq_out.shape == (CHUNK_SAMPLES, 2)
+        assert engine._master_geq_crossfade_remaining == 0
     finally:
         engine.cleanup()
     print("  AudioEngine Broker統合: OK")

@@ -55,3 +55,13 @@
 - [x] Fader、PAN、MASTER音量のUIイベントをBroker経由に移行し、直接DSP更新を段階的に廃止する。
 - [x] Brokerの競合・圧縮・世代検出・Transport Epochを検証する単体テストを追加する。
 - [x] 既存の音声・GUI回帰テストを実行し、README・仕様・GitHub・ZIPを更新する。
+
+## Phase 24B: DSPパラメータのBroker移行
+
+- [x] GAIN・EQ・FX・MASTER GEQの現在の更新API、DSP状態、スレッド境界を監査する。
+- [x] Phase 24Bの設計方針・移行順・リスク・テスト計画をスライド資料にまとめる。
+- [x] BrokerのPatchモデルをGAIN・EQ・FX・MASTER GEQへ拡張する。
+- [x] 音声スレッドがチャンク境界でDSP設定を適用し、状態遷移時のクロスフェードを維持する。
+- [x] UI操作とプロジェクト復元をBroker経由に移行する。
+- [x] 同時操作・音切れ・REC／EXPORT WAV・GUIの回帰テストを追加して実行する。
+- [x] README・仕様書・GitHub・配布ZIP・スライドを更新する。

@@ -22,7 +22,7 @@ from typing import Optional, List, Dict, Tuple
 import numpy as np
 
 from track_model import TrackModel
-from audio_param_broker import AudioParamBroker, TrackMixParams
+from audio_param_broker import AudioParamBroker, TrackMixParams, TrackDSPParams, GEQSnapshot
 from eq_engine import EQEngine, EQParams
 from effect_engine import EffectEngine, EFFECT_PRESETS, MasterLimiter
 from geq_engine import GEQEngine, GEQParams
@@ -87,6 +87,7 @@ class _TrackStreamer:
 
         # パラメータ（スレッドセーフに更新）
         self._gain_db: float = 0.0
+        self._applied_gain_linear: float = 1.0
         self._eq_params: EQParams = EQParams()
         self._effect_preset: str = "None"
         self._effect_enabled: bool = False
@@ -96,7 +97,7 @@ class _TrackStreamer:
         self._eq_engine = EQEngine(sample_rate)
         self._effect_engine = EffectEngine(sample_rate)
 
-    # --- パラメータ更新（UIスレッドから呼ばれる） ---
+    # --- パラメータ更新（音声スレッドのみが呼ぶ） ---
 
     def set_gain(self, gain_db: float):
         with self._lock:
@@ -112,16 +113,25 @@ class _TrackStreamer:
         with self._lock:
             self._effect_preset = preset_name
             self._effect_enabled = enabled
-            # エフェクトが無効化された場合は内部バッファをリセット
-            if not enabled:
-                self._effect_engine.reset_state()
 
     def set_aux(self, enabled: bool):
         """AUX ON/OFFを設定する。TrueのときのみFXを適用する。"""
         with self._lock:
             self._aux_enabled = enabled
-            if not enabled:
-                self._effect_engine.reset_state()
+
+    def apply_dsp_params(self, params: TrackDSPParams):
+        """Broker SnapshotからDSP設定を適用する（音声スレッド専用）。"""
+        with self._lock:
+            if abs(self._gain_db - params.gain_db) > 0.000001:
+                self._gain_db = params.gain_db
+            eq_params = params.eq.to_params()
+            if self._eq_params.to_dict() != eq_params.to_dict():
+                self._eq_params = eq_params
+                self._eq_engine.set_params(eq_params)
+            if self._effect_preset != params.effect_preset or self._effect_enabled != params.effect_enabled:
+                self._effect_preset = params.effect_preset
+                self._effect_enabled = params.effect_enabled
+            self._aux_enabled = params.aux_enabled
 
     # --- 再生位置 ---
 
@@ -224,17 +234,24 @@ class _TrackStreamer:
                     pad = np.zeros((CHUNK_SAMPLES - len(chunk), 2), dtype=np.float32)
                     chunk = np.concatenate([chunk, pad], axis=0)
 
-            # ゲイン適用
-            if abs(self._gain_db) > 0.01:
-                linear = 10.0 ** (self._gain_db / 20.0)
-                chunk = chunk * linear
+            # GAINは前チャンクの実効値からランプし、設定変更時の段差を抑える。
+            target_gain = 10.0 ** (self._gain_db / 20.0)
+            if abs(target_gain - self._applied_gain_linear) > 0.000001:
+                gain_ramp = np.linspace(self._applied_gain_linear, target_gain,
+                                        len(chunk), dtype=np.float32)
+                chunk = chunk * gain_ramp[:, np.newaxis]
+                self._applied_gain_linear = target_gain
+            elif abs(target_gain - 1.0) > 0.000001:
+                chunk = chunk * target_gain
 
             # EQ適用（常に apply_eq を呼び、内部で Flat 時はバイパスしつつ _prev_last_sample を更新する）
             chunk = self._eq_engine.apply_eq(chunk)
 
-            # エフェクト適用（AUX ONのトラックのみ適用）
-            if self._effect_enabled and self._effect_preset != "None" and self._aux_enabled:
-                chunk = self._effect_engine.apply(chunk, self._effect_preset)
+            # AUX OFF/FX OFFもNoneプリセットとして通し、既存FXからのクロスフェードを維持する。
+            effective_preset = (
+                self._effect_preset if self._effect_enabled and self._aux_enabled else "None"
+            )
+            chunk = self._effect_engine.apply(chunk, effective_preset)
 
             # クリップ
             chunk = np.clip(chunk, -1.0, 1.0)
@@ -304,6 +321,10 @@ class AudioEngine:
         # マスターGEQ
         self._master_geq_params: GEQParams = GEQParams()
         self._master_geq_engine: GEQEngine = GEQEngine(SAMPLE_RATE)
+        self._master_geq_active_snapshot: GEQSnapshot = GEQSnapshot()
+        self._master_geq_previous_engine: Optional[GEQEngine] = None
+        self._master_geq_crossfade_remaining: int = 0
+        self._master_geq_crossfade_samples: int = max(1, int(SAMPLE_RATE * 0.020))
         self._master_geq_lock = threading.Lock()
 
         # ストリーミングスレッド
@@ -403,40 +424,32 @@ class AudioEngine:
     # ------------------------------------------------------------------
 
     def update_gain(self, track_id: int, gain_db: float):
-        """ゲインを更新する。再生中は次チャンクから即反映。"""
+        """GAIN更新をBrokerへ登録する。DSPへの適用は次のチャンク境界で行う。"""
         gain_db = max(-24.0, min(24.0, gain_db))
         self._gain_db[track_id] = gain_db
-        with self._lock:
-            s = self._streamers.get(track_id)
-        if s is not None:
-            s.set_gain(gain_db)
+        self._param_broker.submit_track_dsp(track_id, gain_db=gain_db)
+        self._param_changed_event.set()
 
     def update_eq(self, track_id: int, params: EQParams):
-        """EQパラメータを更新する。再生中は次チャンクから即反映。"""
+        """EQ更新をBrokerへ登録する。クロスフェード開始は音声スレッドが担う。"""
         self._eq_params[track_id] = params
-        with self._lock:
-            s = self._streamers.get(track_id)
-        if s is not None:
-            s.set_eq(params)
-            # ストリーミングスレッドに即座にキューを補充するよう通知
-            self._param_changed_event.set()
+        self._param_broker.submit_track_dsp(track_id, eq_params=params)
+        self._param_changed_event.set()
 
     def update_effect(self, track_id: int, preset_name: str, enabled: bool):
-        """エフェクトを更新する。再生中は次チャンクから即反映。"""
+        """FX更新をBrokerへ登録する。クロスフェード開始は音声スレッドが担う。"""
         self._effect_presets[track_id] = preset_name
         self._effect_enabled[track_id] = enabled
-        with self._lock:
-            s = self._streamers.get(track_id)
-        if s is not None:
-            s.set_effect(preset_name, enabled)
+        self._param_broker.submit_track_dsp(
+            track_id, effect_preset=preset_name, effect_enabled=enabled
+        )
+        self._param_changed_event.set()
 
     def set_aux_track(self, track_id: int, enabled: bool):
-        """AUX ON/OFFを設定する。再生中は次チャンクから即反映。"""
+        """AUX ON/OFFをBrokerへ登録する。"""
         self._aux_enabled[track_id] = enabled
-        with self._lock:
-            s = self._streamers.get(track_id)
-        if s is not None:
-            s.set_aux(enabled)
+        self._param_broker.submit_track_dsp(track_id, aux_enabled=enabled)
+        self._param_changed_event.set()
 
     # ------------------------------------------------------------------
     # 再生制御
@@ -472,8 +485,8 @@ class AudioEngine:
                 self._streamers[track.track_id] = s
                 self._channels[track.track_id] = None
 
-        # Phase 24A: 可変TrackModelを音声処理用の不変Snapshotとして確定する。
-        self._param_broker.reset_from_tracks(tracks, self._master_volume)
+        # Phase 24B: ミックス段とDSP段を同一の不変Snapshotとして確定する。
+        self._reset_broker_snapshot(tracks)
         self._playing = True
         self._stop_event.clear()
         self._stream_thread = threading.Thread(
@@ -763,11 +776,7 @@ class AudioEngine:
         else:
             out *= target
 
-        with self._master_geq_lock:
-            geq_params = self._master_geq_params
-            geq_engine = self._master_geq_engine
-        if not geq_params.is_flat():
-            out = geq_engine.apply_vectorized(out)
+        out = self._apply_master_geq_chunk(out)
 
         pre_limit_peak = float(np.max(np.abs(out))) if out.size else 0.0
         with self._master_limiter_lock:
@@ -807,6 +816,50 @@ class AudioEngine:
 
         i16 = (out * MAX_AMPLITUDE).astype(np.int16)
         return self._pygame.sndarray.make_sound(i16)
+
+    def _apply_master_dsp_snapshot(self, snapshot):
+        """Broker SnapshotのMASTER DSP設定を音声スレッドで適用する。"""
+        target = snapshot.master.dsp.geq
+        with self._master_geq_lock:
+            if target == self._master_geq_active_snapshot:
+                return
+            previous_engine = self._master_geq_engine
+            next_engine = GEQEngine(SAMPLE_RATE)
+            next_params = target.to_params()
+            next_engine.set_params(next_params)
+            self._master_geq_previous_engine = previous_engine
+            self._master_geq_engine = next_engine
+            self._master_geq_active_snapshot = target
+            self._master_geq_crossfade_remaining = self._master_geq_crossfade_samples
+
+    def _apply_master_geq_chunk(self, pcm: np.ndarray) -> np.ndarray:
+        """現在のMASTER GEQを適用し、切替中は新旧出力をクロスフェードする。"""
+        with self._master_geq_lock:
+            current_engine = self._master_geq_engine
+            previous_engine = self._master_geq_previous_engine
+            remaining = self._master_geq_crossfade_remaining
+            total = self._master_geq_crossfade_samples
+
+            current_out = current_engine.apply_vectorized(pcm)
+            if previous_engine is None or remaining <= 0:
+                return current_out
+
+            previous_out = previous_engine.apply_vectorized(pcm)
+            fade_len = min(len(pcm), remaining)
+            progressed = total - remaining
+            fade_in = np.linspace(
+                progressed / total, (progressed + fade_len) / total,
+                fade_len, dtype=np.float32,
+            )
+            out = current_out.copy()
+            out[:fade_len] = (
+                previous_out[:fade_len] * (1.0 - fade_in[:, np.newaxis])
+                + current_out[:fade_len] * fade_in[:, np.newaxis]
+            )
+            self._master_geq_crossfade_remaining = max(0, remaining - len(pcm))
+            if self._master_geq_crossfade_remaining == 0:
+                self._master_geq_previous_engine = None
+            return out
 
     def _render_master_mix_chunk(self, tracks: List[TrackModel],
                                  streamers: Dict[int, Optional[_TrackStreamer]],
@@ -854,6 +907,13 @@ class AudioEngine:
             latest_snapshot = self._param_broker.take_snapshot(render_snapshot.generation)
             if latest_snapshot is not None:
                 render_snapshot = latest_snapshot
+
+            # DSP状態の切替はUIスレッドではなく、ここ（チャンク境界）でのみ実行する。
+            for track in tracks:
+                streamer = streamers.get(track.track_id)
+                if streamer is not None:
+                    streamer.apply_dsp_params(render_snapshot.track_for(track.track_id).dsp)
+            self._apply_master_dsp_snapshot(render_snapshot)
 
             mix, has_data = self._render_master_mix_chunk(tracks, streamers, render_snapshot)
             if not has_data or mix is None:
@@ -1022,8 +1082,23 @@ class AudioEngine:
         """全トラックの状態をまとめて更新する。"""
         with self._lock:
             self._tracks_snapshot = list(tracks)
-        self._param_broker.reset_from_tracks(tracks, self._master_volume)
+        self._reset_broker_snapshot(tracks)
         self._param_changed_event.set()
+
+    def _reset_broker_snapshot(self, tracks: List[TrackModel]):
+        """保持済みDSP設定を含むBroker Snapshotを生成する。"""
+        with self._master_geq_lock:
+            master_geq = self._master_geq_params
+        self._param_broker.reset_from_tracks(
+            tracks,
+            self._master_volume,
+            gain_by_track=self._gain_db,
+            eq_by_track=self._eq_params,
+            effect_preset_by_track=self._effect_presets,
+            effect_enabled_by_track=self._effect_enabled,
+            aux_enabled_by_track=self._aux_enabled,
+            master_geq=master_geq,
+        )
 
     # ------------------------------------------------------------------
     # マスター音量
@@ -1121,10 +1196,11 @@ class AudioEngine:
     # ------------------------------------------------------------------
 
     def update_master_geq(self, params: GEQParams):
-        """マスターGEQパラメータを更新する。再生中は次チャンクから即反映。"""
+        """MASTER GEQ更新をBrokerへ登録する。DSP切替は音声スレッドで行う。"""
         with self._master_geq_lock:
             self._master_geq_params = params
-            self._master_geq_engine.set_params(params)
+        self._param_broker.submit_master_geq(params)
+        self._param_changed_event.set()
 
     def get_master_geq_params(self) -> GEQParams:
         """現在のマスターGEQパラメータを返す。"""
@@ -1339,8 +1415,8 @@ class AudioEngine:
         if not self._initialized:
             return ExportResult(success=False, error_message="AudioEngine が初期化されていません。")
 
-        any_solo = any(t.solo for t in tracks)
-        track_arrays: List[Tuple[np.ndarray, TrackModel]] = []
+        export_snapshot = self._param_broker.snapshot()
+        track_arrays: List[Tuple[np.ndarray, TrackModel, TrackMixParams]] = []
         max_len = 0
 
         with self._lock:
@@ -1350,31 +1426,32 @@ class AudioEngine:
             pcm = pcm_snapshot.get(track.track_id)
             if pcm is None:
                 continue
-            if not track.is_audible(any_solo):
+            mix_params = export_snapshot.track_for(track.track_id)
+            if not mix_params.is_audible(export_snapshot.any_solo):
                 continue
 
             # ゲイン適用
-            gain_db = self._gain_db.get(track.track_id, 0.0)
+            gain_db = mix_params.dsp.gain_db
             processed = pcm.copy()
             if abs(gain_db) > 0.01:
                 processed = processed * (10.0 ** (gain_db / 20.0))
 
             # EQ適用
-            eq_params = self._eq_params.get(track.track_id, EQParams())
+            eq_params = mix_params.dsp.eq.to_params()
             if not eq_params.is_flat():
                 eq_eng = EQEngine(SAMPLE_RATE)
                 eq_eng.set_params(eq_params)
                 processed = eq_eng.apply_eq(processed)
 
             # エフェクト適用
-            preset = self._effect_presets.get(track.track_id, "None")
-            enabled = self._effect_enabled.get(track.track_id, False)
+            preset = mix_params.dsp.effect_preset
+            enabled = mix_params.dsp.effect_enabled and mix_params.dsp.aux_enabled
             if enabled and preset != "None" and preset in EFFECT_PRESETS:
                 fx_eng = EffectEngine(SAMPLE_RATE)
                 processed = fx_eng.apply(processed, preset)
 
             processed = np.clip(processed, -1.0, 1.0)
-            track_arrays.append((processed, track))
+            track_arrays.append((processed, track, mix_params))
             max_len = max(max_len, len(processed))
 
         if max_len == 0 or not track_arrays:
@@ -1386,10 +1463,10 @@ class AudioEngine:
         mix_left  = np.zeros(max_len, dtype=np.float64)
         mix_right = np.zeros(max_len, dtype=np.float64)
 
-        for processed, track in track_arrays:
+        for processed, track, mix_params in track_arrays:
             n = len(processed)
             left_gain, right_gain = self._calc_pan_volumes(
-                track.volume * self._master_volume, track.pan
+                mix_params.volume * export_snapshot.master.volume, mix_params.pan
             )
             mix_left[:n]  += processed[:, 0].astype(np.float64) * left_gain * MAX_AMPLITUDE
             mix_right[:n] += processed[:, 1].astype(np.float64) * right_gain * MAX_AMPLITUDE
@@ -1407,8 +1484,7 @@ class AudioEngine:
         clipping_detected = clipping_count > 0
 
         # マスターGEQ適用（ミックス後）
-        with self._master_geq_lock:
-            geq_params = self._master_geq_params
+        geq_params = export_snapshot.master.dsp.geq.to_params()
         if not geq_params.is_flat():
             mix_stereo = np.stack(
                 [mix_left / MAX_AMPLITUDE, mix_right / MAX_AMPLITUDE], axis=1

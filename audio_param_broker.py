@@ -8,10 +8,81 @@ UIは最新の意図だけをBrokerへ登録し、音声スレッドはチャン
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, Literal, Optional, Tuple
 
 from track_model import TrackModel
+
+
+@dataclass(frozen=True)
+class EQSnapshot:
+    """EQParamsをBrokerに安全に格納する不変値オブジェクト。"""
+
+    low_gain_db: float = 0.0
+    mid_gain_db: float = 0.0
+    mid_freq_hz: float = 1000.0
+    mid_q: float = 1.0
+    high_gain_db: float = 0.0
+
+    @classmethod
+    def from_params(cls, params) -> "EQSnapshot":
+        return cls(
+            low_gain_db=float(params.low_gain_db),
+            mid_gain_db=float(params.mid_gain_db),
+            mid_freq_hz=float(params.mid_freq_hz),
+            mid_q=float(params.mid_q),
+            high_gain_db=float(params.high_gain_db),
+        )
+
+    def to_params(self):
+        from eq_engine import EQParams
+        params = EQParams(
+            low_gain_db=self.low_gain_db,
+            mid_gain_db=self.mid_gain_db,
+            mid_freq_hz=self.mid_freq_hz,
+            mid_q=self.mid_q,
+            high_gain_db=self.high_gain_db,
+        )
+        params.clamp()
+        return params
+
+
+@dataclass(frozen=True)
+class GEQSnapshot:
+    """GEQParamsの周波数ゲインを順序固定の不変Tupleへ変換した値。"""
+
+    gains: Tuple[Tuple[float, float], ...] = ()
+
+    @classmethod
+    def from_params(cls, params) -> "GEQSnapshot":
+        return cls(tuple(sorted(
+            (float(freq), float(gain)) for freq, gain in params.get_all_gains().items()
+        )))
+
+    def to_params(self):
+        from geq_engine import GEQParams
+        params = GEQParams()
+        for freq, gain in self.gains:
+            params.set_gain(freq, gain)
+        return params
+
+
+@dataclass(frozen=True)
+class TrackDSPParams:
+    """トラックDSPの切替に必要な、チャンク中は不変の設定集合。"""
+
+    gain_db: float = 0.0
+    eq: EQSnapshot = field(default_factory=EQSnapshot)
+    effect_preset: str = "None"
+    effect_enabled: bool = False
+    aux_enabled: bool = False
+
+
+@dataclass(frozen=True)
+class MasterDSPParams:
+    """MASTER DSPの切替に必要な、チャンク中は不変の設定集合。"""
+
+    geq: GEQSnapshot = field(default_factory=GEQSnapshot)
 
 
 ParamSource = Literal["default", "automation", "manual", "system", "transport"]
@@ -35,6 +106,7 @@ class TrackMixParams:
     pan: float = 0.0
     muted: bool = False
     solo: bool = False
+    dsp: TrackDSPParams = field(default_factory=TrackDSPParams)
 
     def is_audible(self, any_solo: bool) -> bool:
         return not self.muted and (not any_solo or self.solo)
@@ -45,6 +117,7 @@ class MasterMixParams:
     """Phase 24AでBroker管理するMASTERミックスパラメータ。"""
 
     volume: float = 1.0
+    dsp: MasterDSPParams = field(default_factory=MasterDSPParams)
 
 
 @dataclass(frozen=True)
@@ -118,20 +191,42 @@ class AudioParamBroker:
         with self._lock:
             return self._transport_epoch
 
-    def reset_from_tracks(self, tracks: Iterable[TrackModel], master_volume: float) -> int:
+    def reset_from_tracks(self, tracks: Iterable[TrackModel], master_volume: float,
+                          gain_by_track: Optional[Dict[int, float]] = None,
+                          eq_by_track: Optional[Dict[int, object]] = None,
+                          effect_preset_by_track: Optional[Dict[int, str]] = None,
+                          effect_enabled_by_track: Optional[Dict[int, bool]] = None,
+                          aux_enabled_by_track: Optional[Dict[int, bool]] = None,
+                          master_geq: Optional[object] = None) -> int:
         """再生開始時にUIモデルの現在値を一つのSnapshotとして登録する。"""
         with self._condition:
-            self._tracks = {
-                track.track_id: TrackMixParams(
+            gain_by_track = gain_by_track or {}
+            eq_by_track = eq_by_track or {}
+            effect_preset_by_track = effect_preset_by_track or {}
+            effect_enabled_by_track = effect_enabled_by_track or {}
+            aux_enabled_by_track = aux_enabled_by_track or {}
+            self._tracks = {}
+            for track in tracks:
+                eq_params = eq_by_track.get(track.track_id)
+                dsp = TrackDSPParams(
+                    gain_db=self._clamp_gain(float(gain_by_track.get(track.track_id, 0.0))),
+                    eq=EQSnapshot.from_params(eq_params) if eq_params is not None else EQSnapshot(),
+                    effect_preset=str(effect_preset_by_track.get(track.track_id, "None")),
+                    effect_enabled=bool(effect_enabled_by_track.get(track.track_id, False)),
+                    aux_enabled=bool(aux_enabled_by_track.get(track.track_id, False)),
+                )
+                self._tracks[track.track_id] = TrackMixParams(
                     track_id=track.track_id,
                     volume=self._clamp_volume(track.volume),
                     pan=self._clamp_pan(track.pan),
-                    muted=bool(track.muted),
-                    solo=bool(track.solo),
+                    muted=bool(track.muted), solo=bool(track.solo), dsp=dsp,
                 )
-                for track in tracks
-            }
-            self._master = MasterMixParams(volume=self._clamp_master_volume(master_volume))
+            master_dsp = MasterDSPParams(
+                geq=GEQSnapshot.from_params(master_geq) if master_geq is not None else GEQSnapshot()
+            )
+            self._master = MasterMixParams(
+                volume=self._clamp_master_volume(master_volume), dsp=master_dsp
+            )
             self._last_writer.clear()
             return self._commit_locked()
 
@@ -160,6 +255,33 @@ class AudioParamBroker:
                              transport_epoch: Optional[int] = None) -> int:
         return self.submit_batch(ParamBatch((
             ParamPatch(("master", None, "volume"), volume, source, transport_epoch),
+        )))
+
+    def submit_track_dsp(self, track_id: int, *, gain_db: Optional[float] = None,
+                         eq_params: Optional[object] = None,
+                         effect_preset: Optional[str] = None,
+                         effect_enabled: Optional[bool] = None,
+                         aux_enabled: Optional[bool] = None,
+                         source: ParamSource = "manual",
+                         transport_epoch: Optional[int] = None) -> int:
+        """トラックDSPの複数値を一つのgenerationとして登録する。"""
+        patches = []
+        if gain_db is not None:
+            patches.append(ParamPatch(("track", track_id, "gain_db"), gain_db, source, transport_epoch))
+        if eq_params is not None:
+            patches.append(ParamPatch(("track", track_id, "eq"), EQSnapshot.from_params(eq_params), source, transport_epoch))
+        if effect_preset is not None:
+            patches.append(ParamPatch(("track", track_id, "effect_preset"), effect_preset, source, transport_epoch))
+        if effect_enabled is not None:
+            patches.append(ParamPatch(("track", track_id, "effect_enabled"), effect_enabled, source, transport_epoch))
+        if aux_enabled is not None:
+            patches.append(ParamPatch(("track", track_id, "aux_enabled"), aux_enabled, source, transport_epoch))
+        return self.submit_batch(ParamBatch(tuple(patches)))
+
+    def submit_master_geq(self, params: object, *, source: ParamSource = "manual",
+                          transport_epoch: Optional[int] = None) -> int:
+        return self.submit_batch(ParamBatch((
+            ParamPatch(("master", None, "geq"), GEQSnapshot.from_params(params), source, transport_epoch),
         )))
 
     def submit_batch(self, batch: ParamBatch) -> int:
@@ -219,29 +341,59 @@ class AudioParamBroker:
 
     def _apply_patch_locked(self, patch: ParamPatch) -> bool:
         scope, track_id, field = patch.key
-        if scope == "master" and field == "volume":
-            value = self._clamp_master_volume(float(patch.value))
-            if value == self._master.volume:
+        if scope == "master":
+            if field == "volume":
+                value = self._clamp_master_volume(float(patch.value))
+                updated = MasterMixParams(volume=value, dsp=self._master.dsp)
+            elif field == "geq":
+                updated = MasterMixParams(
+                    volume=self._master.volume,
+                    dsp=MasterDSPParams(geq=patch.value),
+                )
+            else:
+                raise ValueError(f"Unsupported parameter key: {patch.key}")
+            if updated == self._master:
                 return False
-            self._master = MasterMixParams(volume=value)
+            self._master = updated
             return True
 
         if scope != "track" or track_id is None:
             raise ValueError(f"Unsupported parameter key: {patch.key}")
 
         current = self._tracks.get(track_id, TrackMixParams(track_id=track_id))
+        dsp = current.dsp
         if field == "volume":
             updated = TrackMixParams(track_id, self._clamp_volume(float(patch.value)),
-                                     current.pan, current.muted, current.solo)
+                                     current.pan, current.muted, current.solo, dsp)
         elif field == "pan":
             updated = TrackMixParams(track_id, current.volume, self._clamp_pan(float(patch.value)),
-                                     current.muted, current.solo)
+                                     current.muted, current.solo, dsp)
         elif field == "muted":
             updated = TrackMixParams(track_id, current.volume, current.pan,
-                                     bool(patch.value), current.solo)
+                                     bool(patch.value), current.solo, dsp)
         elif field == "solo":
             updated = TrackMixParams(track_id, current.volume, current.pan,
-                                     current.muted, bool(patch.value))
+                                     current.muted, bool(patch.value), dsp)
+        elif field == "gain_db":
+            updated_dsp = TrackDSPParams(self._clamp_gain(float(patch.value)), dsp.eq,
+                                         dsp.effect_preset, dsp.effect_enabled, dsp.aux_enabled)
+            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp)
+        elif field == "eq":
+            updated_dsp = TrackDSPParams(dsp.gain_db, patch.value,
+                                         dsp.effect_preset, dsp.effect_enabled, dsp.aux_enabled)
+            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp)
+        elif field == "effect_preset":
+            updated_dsp = TrackDSPParams(dsp.gain_db, dsp.eq, str(patch.value),
+                                         dsp.effect_enabled, dsp.aux_enabled)
+            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp)
+        elif field == "effect_enabled":
+            updated_dsp = TrackDSPParams(dsp.gain_db, dsp.eq, dsp.effect_preset,
+                                         bool(patch.value), dsp.aux_enabled)
+            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp)
+        elif field == "aux_enabled":
+            updated_dsp = TrackDSPParams(dsp.gain_db, dsp.eq, dsp.effect_preset,
+                                         dsp.effect_enabled, bool(patch.value))
+            updated = TrackMixParams(track_id, current.volume, current.pan, current.muted, current.solo, updated_dsp)
         else:
             raise ValueError(f"Unsupported parameter key: {patch.key}")
         if updated == current:
@@ -270,6 +422,10 @@ class AudioParamBroker:
     @staticmethod
     def _clamp_master_volume(value: float) -> float:
         return max(0.0, min(1.5, value))
+
+    @staticmethod
+    def _clamp_gain(value: float) -> float:
+        return max(-24.0, min(24.0, value))
 
     @staticmethod
     def _clamp_pan(value: float) -> float:
